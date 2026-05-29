@@ -1,4 +1,4 @@
-﻿(function () {
+(function () {
   var root = document.getElementById("soft-tools-markup-root");
   if (!root) return;
 
@@ -20,6 +20,7 @@
   var GALLERY_POINTS_FIRST_STORE_KEY = "soft_tools_gallery_points_first";
   var ENHANCEMENT_MODE_STORE_KEY = "soft_tools_enhancement_mode";
   var POINT_SEARCH_METHOD_STORE_KEY = "soft_tools_point_search_method";
+  var POINT_SEARCH_CANDIDATE_LIMIT = 5;
   var BASE_MAP_NAMES = [
     "Esri Satellite",
     "Esri Streets",
@@ -1408,6 +1409,77 @@
     return ids;
   }
 
+  function pointSearchCandidateCount(candidates, targetIds) {
+    var total = 0;
+    var allowed = null;
+    if (targetIds && targetIds.length) {
+      allowed = {};
+      targetIds.forEach(function (imageId) {
+        allowed[String(imageId)] = true;
+      });
+    }
+    Object.keys(candidates || {}).forEach(function (imageId) {
+      if (allowed && !allowed[String(imageId)]) return;
+      total += (candidates[imageId] || []).length;
+    });
+    return total;
+  }
+
+  function orderedPointSearchTargetIds(sourceImageId, sourcePointIds) {
+    var sourceIndex = state.images.findIndex(function (image) {
+      return String(image.id) === String(sourceImageId);
+    });
+    if (sourceIndex < 0) return [];
+    var ids = [];
+    for (var distance = 1; distance < state.images.length; distance += 1) {
+      [-distance, distance].forEach(function (delta) {
+        var index = sourceIndex + delta;
+        if (index < 0 || index >= state.images.length) return;
+        var image = state.images[index];
+        if (!image || String(image.id) === String(sourceImageId)) return;
+        var existing = imagePointIds(image.id);
+        var hasMissingPoint = Object.keys(sourcePointIds).some(function (pointId) {
+          return !existing[pointId];
+        });
+        if (hasMissingPoint) ids.push(image.id);
+      });
+    }
+    return ids;
+  }
+
+  function stopCurrentPointSearch() {
+    var search = pointSearchState();
+    if (!search.running) return;
+    pointSearchRunToken += 1;
+    setState({
+      pointSearch: Object.assign({}, search, {
+        running: false,
+        currentJob: null,
+        progress: { done: Number((search.progress || {}).done || 0), total: Number((search.progress || {}).total || 0) }
+      }),
+      message: "Поточний пошук зупинено. Переходжу до наступного в черзі.",
+      error: ""
+    });
+    window.setTimeout(processPointSearchQueue, 0);
+  }
+
+  function cancelAllPointSearch() {
+    var search = pointSearchState();
+    pointSearchRunToken += 1;
+    setState({
+      pointSearch: Object.assign({}, search, {
+        mode: false,
+        choosingMethod: false,
+        running: false,
+        currentJob: null,
+        queue: [],
+        progress: { done: 0, total: 0 }
+      }),
+      message: "Пошук скасовано.",
+      error: ""
+    });
+  }
+
   function createPointSearchJob(sourceImageId, method) {
     var sourceImage = state.images.find(function (image) { return image.id === sourceImageId; });
     var sourceEntries = observationsForImage(sourceImageId);
@@ -1419,15 +1491,7 @@
     sourceEntries.forEach(function (entry) {
       sourcePointIds[String(entry.point.id)] = true;
     });
-    var targetIds = state.images.filter(function (image) {
-      if (String(image.id) === String(sourceImageId)) return false;
-      var existing = imagePointIds(image.id);
-      return Object.keys(sourcePointIds).some(function (pointId) {
-        return !existing[pointId];
-      });
-    }).map(function (image) {
-      return image.id;
-    });
+    var targetIds = orderedPointSearchTargetIds(sourceImageId, sourcePointIds);
     if (!targetIds.length) {
       setState({ error: "Немає фото, де ці точки ще не позначені." });
       return null;
@@ -1438,7 +1502,9 @@
       method: normalizePointSearchMethod(method),
       targetIds: targetIds,
       done: 0,
-      total: targetIds.length
+      total: targetIds.length,
+      candidateLimit: POINT_SEARCH_CANDIDATE_LIMIT,
+      candidateCount: 0
     };
   }
 
@@ -1457,8 +1523,8 @@
         sourceImageId: search.running ? search.sourceImageId : sourceImageId
       }),
       message: search.running
-        ? ("Додано в чергу: " + pointSearchMethodLabel(method) + ", " + job.total + " фото.")
-        : ("Пошук додано: " + pointSearchMethodLabel(method) + ", " + job.total + " фото."),
+        ? ("Додано в чергу: " + pointSearchMethodLabel(method) + ", до " + job.candidateLimit + " кандидатів.")
+        : ("Пошук додано: " + pointSearchMethodLabel(method) + ", до " + job.candidateLimit + " кандидатів."),
       error: ""
     });
     window.setTimeout(processPointSearchQueue, 0);
@@ -1483,7 +1549,7 @@
         method: job.method,
         progress: { done: 0, total: job.total }
       }),
-      message: "Шукаю точки " + pointSearchMethodLabel(job.method) + ": 0/" + job.total + (queue.length ? ". У черзі: " + queue.length + "." : "."),
+      message: "Шукаю точки " + pointSearchMethodLabel(job.method) + ": 0/" + job.candidateLimit + " кандидатів, перевірено 0/" + job.total + " фото" + (queue.length ? ". У черзі: " + queue.length + "." : "."),
       error: ""
     });
     runPointSearchJob(job, token, 0);
@@ -1501,7 +1567,7 @@
           currentJob: null,
           progress: { done: job.total, total: job.total }
         }),
-        message: "Пошук завершено: " + job.total + "/" + job.total + ".",
+        message: "Пошук завершено: знайдено " + pointSearchCandidateCount(pointSearchState().candidates || {}, job.targetIds) + "/" + job.candidateLimit + " кандидатів.",
         error: ""
       });
       window.setTimeout(processPointSearchQueue, 0);
@@ -1525,20 +1591,29 @@
       var mergedResults = Object.assign({}, currentSearch.results || {}, results);
       var mergedCandidates = Object.assign({}, currentSearch.candidates || {}, candidates);
       var queueLength = (currentSearch.queue || []).length;
+      var foundCount = pointSearchCandidateCount(mergedCandidates, job.targetIds);
+      var reachedLimit = foundCount >= Number(job.candidateLimit || POINT_SEARCH_CANDIDATE_LIMIT);
       setState({
         pointSearch: Object.assign({}, currentSearch, {
           mode: false,
           choosingMethod: false,
-          running: true,
+          running: !reachedLimit,
+          currentJob: reachedLimit ? null : currentSearch.currentJob,
           sourceImageId: job.sourceImageId,
           method: normalizePointSearchMethod(json.method || job.method),
           results: mergedResults,
           candidates: mergedCandidates,
           progress: { done: nextOffset, total: job.total }
         }),
-        message: "Шукаю точки " + pointSearchMethodLabel(job.method) + ": " + nextOffset + "/" + job.total + (queueLength ? ". У черзі: " + queueLength + "." : "."),
+        message: reachedLimit
+          ? ("Поточний пошук завершено: знайдено " + foundCount + "/" + job.candidateLimit + " кандидатів.")
+          : ("Шукаю точки " + pointSearchMethodLabel(job.method) + ": " + foundCount + "/" + job.candidateLimit + " кандидатів, перевірено " + nextOffset + "/" + job.total + " фото" + (queueLength ? ". У черзі: " + queueLength + "." : ".")),
         error: ""
       });
+      if (reachedLimit) {
+        window.setTimeout(processPointSearchQueue, 0);
+        return;
+      }
       runPointSearchJob(job, token, nextOffset);
     }).catch(function (error) {
       if (token !== pointSearchRunToken) return;
@@ -1691,6 +1766,12 @@
     var primaryButton = prepareMode
       ? taskButton + '<span class="soft-tools-enter-markup-wrap" title="' + (markupBlocked ? escapeHtml(enterMarkupHint) : "") + '"><button id="soft-tools-enter-markup" type="button" class="btn btn-primary btn-sm" ' + (state.busy || markupBlocked ? "disabled" : "") + '>Перейти до прив\'язки</button></span>'
       : '<button id="soft-tools-go-task" type="button" class="btn btn-primary btn-sm" ' + (state.busy ? "disabled" : "") + '><i class="fa fa-arrow-left"></i> До задачі</button>';
+    var pointSearchControls = (!prepareMode && (search.running || (search.queue || []).length)) ? (
+      '<div class="soft-tools-gallery-selection-tools">' +
+        '<button id="soft-tools-stop-current-search" type="button" class="btn btn-default btn-sm" ' + (!search.running ? "disabled" : "") + '>Зупинити поточний</button>' +
+        '<button id="soft-tools-cancel-all-search" type="button" class="btn btn-default btn-sm">Скасувати весь пошук</button>' +
+      '</div>'
+    ) : "";
     var prepareTools = prepareMode ? (
       '<div class="soft-tools-gallery-selection-tools">' +
         '<span class="soft-tools-gallery-selection-count">' + escapeHtml(selectionLabel) + '</span>' +
