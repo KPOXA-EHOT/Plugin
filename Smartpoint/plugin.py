@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import mimetypes
 import os
@@ -318,16 +318,22 @@ class Plugin(SmartAlignMixin, PluginBase):
         return [Menu("Smartpoint", self.public_url(""), "fa fa-crosshairs fa-fw")]
 
     def include_js_files(self):
-        return ["soft_tools.js", "smart_align.js"]
+        return ["soft_tools.js", "smart_align.js", "orthophoto_mosaic.js", "orthophoto_mosaic_page.js"]
 
     def include_css_files(self):
-        return ["soft_tools.css", "smart_align.css"]
+        return ["soft_tools.css", "smart_align.css", "orthophoto_mosaic.css", "orthophoto_mosaic_page.css"]
 
     def app_mount_points(self):
         @login_required
         def dashboard(request):
             return render(request, self.template_path("dashboard.html"), {
                 "title": "Smartpoint"
+            })
+
+        @login_required
+        def orthophoto_mosaic_page(request):
+            return render(request, self.template_path("orthophoto_mosaic.html"), {
+                "title": "Об’єднання ортофото"
             })
 
         @login_required
@@ -364,6 +370,77 @@ class Plugin(SmartAlignMixin, PluginBase):
         @require_GET
         def session_data(request, session_id):
             return JsonResponse(self.load_session(session_id))
+
+        @login_required
+        @require_GET
+        def mosaic_tasks(request):
+            tasks = models.Task.objects.filter(
+                available_assets__contains="{orthophoto.tif}"
+            ).select_related("project").order_by("-created_at")[:200]
+
+            items = []
+            for task in tasks:
+                try:
+                    check_project_perms(request, task.project)
+                except Exception:
+                    continue
+                extent = task.orthophoto_extent.extent if task.orthophoto_extent else None
+                items.append({
+                    "id": str(task.id),
+                    "project_id": task.project_id,
+                    "project_name": task.project.name,
+                    "task_name": task.name,
+                    "created_at": task.created_at.isoformat() if task.created_at else "",
+                    "bounds": list(extent) if extent else None,
+                    "tile_url": "/api/projects/{}/tasks/{}/orthophoto/tiles/{{z}}/{{x}}/{{y}}.png".format(task.project_id, task.id)
+                })
+            return JsonResponse({"tasks": items})
+
+        @login_required
+        @require_GET
+        def mosaic_orthophotos(request):
+            try:
+                bbox = parse_bbox(request.GET.get("bbox"))
+            except ValueError as e:
+                return HttpResponseBadRequest(str(e))
+            bounds_geom = Polygon.from_bbox(bbox)
+            tasks = models.Task.objects.filter(
+                available_assets__contains="{orthophoto.tif}",
+                orthophoto_extent__isnull=False,
+                orthophoto_extent__intersects=bounds_geom
+            ).select_related("project").order_by("-created_at")[:120]
+            items = []
+            for task in tasks:
+                try:
+                    check_project_perms(request, task.project)
+                except Exception:
+                    continue
+                extent = task.orthophoto_extent.extent if task.orthophoto_extent else None
+                if not extent or not bbox_intersects(bbox, extent):
+                    continue
+                items.append({
+                    "id": str(task.id),
+                    "project_id": task.project_id,
+                    "project_name": task.project.name,
+                    "task_name": task.name,
+                    "created_at": task.created_at.isoformat() if task.created_at else "",
+                    "bounds": list(extent),
+                    "tile_url": "/api/projects/{}/tasks/{}/orthophoto/tiles/{{z}}/{{x}}/{{y}}.png".format(task.project_id, task.id)
+                })
+            return JsonResponse({"orthophotos": items})
+
+        @login_required
+        @require_POST
+        def mosaic_create(request):
+            payload = self.read_json_body(request)
+            layers = payload.get("layers", [])
+            if not isinstance(layers, list) or len(layers) < 2:
+                return HttpResponseBadRequest("Select at least 2 orthophotos")
+            return JsonResponse({
+                "success": False,
+                "message": "Список шарів отримано. Merge backend буде підключено наступним етапом.",
+                "layers": layers
+            })
 
         @login_required
         @require_GET
@@ -600,6 +677,7 @@ class Plugin(SmartAlignMixin, PluginBase):
         return [
             MountPoint("$", dashboard),
             MountPoint("prepare/$", prepare),
+            MountPoint("mosaic/$", orthophoto_mosaic_page),
             MountPoint("session/(?P<session_id>[^/]+)/markup/$", markup),
             MountPoint("session/(?P<session_id>[^/]+)/(?P<kind>prepared|preview|original|original_preview)/(?P<filename>.+)$", session_file),
             MountPoint("api/session/(?P<session_id>[^/]+)/$", session_data),
@@ -614,7 +692,10 @@ class Plugin(SmartAlignMixin, PluginBase):
             MountPoint("api/session/(?P<session_id>[^/]+)/task/$", go_to_task),
             MountPoint("api/projects/(?P<project_id>[^/]+)/tasks/(?P<task_id>[^/]+)/orthophoto/delta/$", delta_orthophoto_export),
             MountPoint("api/projects/(?P<project_id>[^/]+)/tasks/(?P<task_id>[^/]+)/3d/delta/$", delta_3d_export),
-            MountPoint("api/delta/(?P<export_id>[0-9a-f-]+)/download/$", download_delta_export)
+            MountPoint("api/delta/(?P<export_id>[0-9a-f-]+)/download/$", download_delta_export),
+            MountPoint("api/mosaic/tasks/$", mosaic_tasks),
+            MountPoint("api/mosaic/orthophotos/$", mosaic_orthophotos),
+            MountPoint("api/mosaic/create/$", mosaic_create)
         ] + self.smartalign_mount_points()
 
     def session_dir(self, session_id):

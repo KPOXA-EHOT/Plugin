@@ -1,4 +1,4 @@
-﻿(function () {
+(function () {
   if (window.__softToolsPluginLoaded) return;
   window.__softToolsPluginLoaded = true;
 
@@ -1054,6 +1054,81 @@
   PluginsAPI.Dashboard.addNewTaskPanelItem(function () {
     return SoftToolsNewTaskPanelItem;
   });
+
+
+  function softToolsMosaicRemoveDuplicateButtons() {
+    var buttons = document.querySelectorAll('.soft-tools-mosaic-button, #soft-tools-mosaic-button');
+    for (var i = 1; i < buttons.length; i += 1) {
+      if (buttons[i] && buttons[i].parentNode) buttons[i].parentNode.removeChild(buttons[i]);
+    }
+  }
+
+  function softToolsMosaicOpen() {
+    window.location.href = '/plugins/Smartpoint/mosaic/';
+  }
+
+  function softToolsMosaicInstallButton() {
+    var existing = document.getElementById('soft-tools-mosaic-button');
+    var importButtons = Array.prototype.slice.call(document.querySelectorAll('button, a')).filter(function (el) {
+      return /Імпортувати|Import/i.test(String(el.textContent || ''));
+    });
+    if (!importButtons.length) return;
+    var importButton = importButtons[0];
+    if (!existing) {
+      existing = document.createElement(importButton.tagName === 'A' ? 'a' : 'button');
+      existing.id = 'soft-tools-mosaic-button';
+      existing.type = 'button';
+      existing.href = 'javascript:void(0)';
+      existing.className = importButton.className + ' soft-tools-mosaic-button';
+      existing.innerHTML = '<i class="fa fa-object-group"></i> Об’єднати ортофото';
+      existing.addEventListener('click', function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        softToolsMosaicOpen();
+      });
+      importButton.parentNode.insertBefore(existing, importButton.nextSibling);
+    }
+    softToolsMosaicRemoveDuplicateButtons();
+  }
+
+  function softToolsMosaicStartObserver() {
+    softToolsMosaicInstallButton();
+    if (window.__softToolsMosaicObserver) return;
+    window.__softToolsMosaicObserver = new MutationObserver(function () {
+      softToolsMosaicInstallButton();
+    });
+    window.__softToolsMosaicObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', softToolsMosaicStartObserver);
+  } else {
+    softToolsMosaicStartObserver();
+  }
+
 })();
 
 
+
+
+/* Smartpoint Mosaic page redirect override */
+(function () {
+  function patchMosaicButtons() {
+    var buttons = document.querySelectorAll('#soft-tools-mosaic-button, .soft-tools-mosaic-button, #smartpoint-mosaic-button, .smartpoint-mosaic-button, [data-smartpoint-mosaic-button]');
+    Array.prototype.forEach.call(buttons, function (button) {
+      if (button.getAttribute('data-smartpoint-page-patched') === '1') return;
+      button.setAttribute('data-smartpoint-page-patched', '1');
+      button.onclick = function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        window.location.href = '/plugins/Smartpoint/mosaic/';
+        return false;
+      };
+    });
+  }
+  patchMosaicButtons();
+  if (window.MutationObserver) {
+    new MutationObserver(patchMosaicButtons).observe(document.documentElement, { childList: true, subtree: true });
+  }
+  window.setInterval(patchMosaicButtons, 1200);
+})();
