@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@loaders.gl/tile-converter": "^4.4.1"
+  }
+}

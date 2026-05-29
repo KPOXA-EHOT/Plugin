@@ -1,0 +1,13 @@
+{
+  "name": "Smartpoint",
+  "webodmMinVersion": "0.7.1",
+  "description": "Image preparation, GCP tools, SmartAlign orthophoto alignment and custom Delta exports.",
+  "version": "0.1.0",
+  "author": "Soft",
+  "email": "",
+  "repository": "",
+  "tags": ["gcp", "video", "export", "images", "alignment", "orthophoto"],
+  "homepage": "",
+  "experimental": true,
+  "deprecated": false
+}
