@@ -438,6 +438,7 @@ class Plugin(SmartAlignMixin, PluginBase):
         def mosaic_create(request):
             try:
                 payload = self.read_json_body(request)
+                logger.info("Smartpoint mosaic_create called with %s layers", len(payload.get("layers", []) if isinstance(payload, dict) else []))
                 result = self.create_mosaic_external_task(request, payload.get("layers", []))
                 return JsonResponse({
                     "success": True,
@@ -972,6 +973,7 @@ class Plugin(SmartAlignMixin, PluginBase):
             translate_args += ["-a_nodata", str(nodata)]
         translate_args += [warp_path, output_path]
         self.run_gdal(translate_args)
+        self.apply_mosaic_black_mask(output_path)
 
         export = {
             "id": export_id,
@@ -993,10 +995,15 @@ class Plugin(SmartAlignMixin, PluginBase):
         if not isinstance(layers, list) or len(layers) < 2:
             raise ValueError("Оберіть мінімум 2 ортофото")
 
-        ordered_layers = sorted(layers, key=lambda item: int(item.get("order", 0) if isinstance(item, dict) else 0))
-        input_paths = []
+        ordered_layers = sorted(
+            layers,
+            key=lambda item: int(item.get("order", 0) if isinstance(item, dict) else 0),
+            reverse=True
+        )
         public_layers = []
         project_ids = set()
+        source_items = []
+        target_epsg = None
 
         for item in ordered_layers:
             if not isinstance(item, dict):
@@ -1013,8 +1020,16 @@ class Plugin(SmartAlignMixin, PluginBase):
                     raise ValueError("Ортофото '{}' не має CRS".format(task.name or task.id))
                 if dataset.width <= 0 or dataset.height <= 0:
                     raise ValueError("Ортофото '{}' має некоректний розмір".format(task.name or task.id))
+                if target_epsg is None:
+                    target_epsg = dataset.crs.to_epsg()
+                    if target_epsg is None:
+                        center_x = (dataset.bounds.left + dataset.bounds.right) / 2.0
+                        center_y = (dataset.bounds.bottom + dataset.bounds.top) / 2.0
+                        lon, lat = rio_transform(dataset.crs, CRS.from_epsg(4326), [center_x], [center_y])
+                        zone = int((lon[0] + 180.0) / 6.0) + 1
+                        target_epsg = 32600 + zone if lat[0] >= 0 else 32700 + zone
 
-            input_paths.append(source_path)
+            source_items.append({"path": source_path, "task": task, "layer": item})
             project_ids.add(str(task.project_id))
             public_layers.append({
                 "project_id": str(task.project_id),
@@ -1024,7 +1039,7 @@ class Plugin(SmartAlignMixin, PluginBase):
                 "order": int(item.get("order", 0) or 0)
             })
 
-        if len(input_paths) < 2:
+        if len(source_items) < 2:
             raise ValueError("Оберіть мінімум 2 доступні ортофото")
         if len(project_ids) != 1:
             raise ValueError("Для імпорту в проект оберіть ортофото з одного проекту")
@@ -1033,45 +1048,9 @@ class Plugin(SmartAlignMixin, PluginBase):
         export_dir = self.delta_export_dir(export_id)
         os.makedirs(export_dir, exist_ok=True)
         filename = "merged_orthophoto_{}.tif".format(datetime.utcnow().strftime("%Y%m%d_%H%M%S"))
-        vrt_path = safe_child(export_dir, "merged_orthophoto.vrt")
         output_path = safe_child(export_dir, filename)
 
-        gdalbuildvrt = self.find_gdal_tool("gdalbuildvrt")
-        gdal_translate = self.find_gdal_tool("gdal_translate")
-
-        vrt_args = [
-            gdalbuildvrt,
-            "-overwrite",
-            "-resolution", "highest",
-            "-r", "nearest",
-            vrt_path,
-        ] + input_paths
-        self.run_gdal(vrt_args)
-
-        with rasterio.open(vrt_path, "r") as vrt:
-            if vrt.crs is None:
-                raise ValueError("Об’єднаний VRT не має CRS")
-            pixel_count = int(vrt.width) * int(vrt.height)
-            if pixel_count > 2500000000:
-                raise ValueError(
-                    "Об’єднане ортофото занадто велике: {} x {} px. "
-                    "Ймовірно, ортофото мають різну CRS/масштаб або знаходяться дуже далеко одне від одного.".format(vrt.width, vrt.height)
-                )
-
-        translate_args = [
-            gdal_translate,
-            "-of", "COG",
-            "-co", "BLOCKSIZE={}".format(DELTA_BLOCKSIZE),
-            "-co", "COMPRESS={}".format(DELTA_COMPRESSION),
-            "-co", "PREDICTOR=2",
-            "-co", "BIGTIFF=IF_SAFER",
-            "-co", "NUM_THREADS=ALL_CPUS",
-            "--config", "GDAL_NUM_THREADS", "ALL_CPUS",
-            "--config", "GDAL_TIFF_INTERNAL_MASK", "YES",
-            vrt_path,
-            output_path,
-        ]
-        self.run_gdal(translate_args)
+        output_path = self.create_mosaic_layer_composite(source_items, target_epsg, export_dir, output_path)
 
         export = {
             "id": export_id,
@@ -1086,6 +1065,164 @@ class Plugin(SmartAlignMixin, PluginBase):
             json.dump(export, f, ensure_ascii=False, indent=2)
         return export
 
+    def create_mosaic_layer_composite(self, source_items, target_epsg, export_dir, output_path):
+        logger.info("Smartpoint mosaic compositor start: layers=%s target_epsg=%s", len(source_items), target_epsg)
+        try:
+            import numpy as np
+            from rasterio.warp import calculate_default_transform, reproject, Resampling
+            from rasterio.windows import Window
+            from rasterio.transform import array_bounds
+            from rasterio.enums import ColorInterp
+        except Exception as e:
+            raise ValueError("Rasterio/NumPy is required for mosaic composition: {}".format(e))
+
+        target_crs = CRS.from_epsg(int(target_epsg))
+        warped_paths = []
+        bounds = []
+        pixel_size_x = None
+        pixel_size_y = None
+
+        for index, item in enumerate(source_items):
+            source_path = item["path"]
+            warped_path = safe_child(export_dir, "mosaic_layer_{}.tif".format(index))
+            with rasterio.open(source_path, "r") as src:
+                transform, width, height = calculate_default_transform(
+                    src.crs, target_crs, src.width, src.height, *src.bounds
+                )
+                if width <= 0 or height <= 0:
+                    raise ValueError("Один із шарів має некоректну геометрію")
+                px = abs(transform.a)
+                py = abs(transform.e)
+                pixel_size_x = px if pixel_size_x is None else min(pixel_size_x, px)
+                pixel_size_y = py if pixel_size_y is None else min(pixel_size_y, py)
+                b = array_bounds(height, width, transform)
+                bounds.append(b)
+
+                profile = src.profile.copy()
+                profile.update({
+                    "driver": "GTiff",
+                    "crs": target_crs,
+                    "transform": transform,
+                    "width": width,
+                    "height": height,
+                    "count": 4,
+                    "dtype": "uint8",
+                    "nodata": None,
+                    "compress": DELTA_COMPRESSION,
+                    "tiled": True,
+                    "blockxsize": DELTA_BLOCKSIZE,
+                    "blockysize": DELTA_BLOCKSIZE,
+                    "BIGTIFF": "IF_SAFER"
+                })
+
+                with rasterio.open(warped_path, "w", **profile) as dst:
+                    for band_index in (1, 2, 3):
+                        if src.count >= band_index:
+                            reproject(
+                                source=rasterio.band(src, band_index),
+                                destination=rasterio.band(dst, band_index),
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=transform,
+                                dst_crs=target_crs,
+                                src_nodata=src.nodata,
+                                dst_nodata=0,
+                                resampling=Resampling.nearest
+                            )
+                    if src.count >= 4:
+                        reproject(
+                            source=rasterio.band(src, 4),
+                            destination=rasterio.band(dst, 4),
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=transform,
+                            dst_crs=target_crs,
+                            src_nodata=0,
+                            dst_nodata=0,
+                            resampling=Resampling.nearest
+                        )
+                    else:
+                        for _, window in dst.block_windows(1):
+                            rgb = dst.read([1, 2, 3], window=window)
+                            alpha = np.where(np.any(rgb != 0, axis=0), 255, 0).astype("uint8")
+                            dst.write(alpha, indexes=4, window=window)
+                    try:
+                        dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+                    except Exception:
+                        pass
+            warped_paths.append(warped_path)
+
+        west = min(b[0] for b in bounds)
+        south = min(b[1] for b in bounds)
+        east = max(b[2] for b in bounds)
+        north = max(b[3] for b in bounds)
+        if pixel_size_x is None or pixel_size_y is None or pixel_size_x <= 0 or pixel_size_y <= 0:
+            raise ValueError("Не вдалося визначити роздільну здатність мозаїки")
+
+        width = int(round((east - west) / pixel_size_x))
+        height = int(round((north - south) / pixel_size_y))
+        if width <= 0 or height <= 0:
+            raise ValueError("Об’єднана мозаїка має некоректний розмір")
+        if int(width) * int(height) > 2500000000:
+            raise ValueError(
+                "Об’єднане ортофото занадто велике: {} x {} px. "
+                "Ймовірно, ортофото мають різну CRS/масштаб або знаходяться дуже далеко одне від одного.".format(width, height)
+            )
+
+        from rasterio.transform import from_origin
+        out_transform = from_origin(west, north, pixel_size_x, pixel_size_y)
+        profile = {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": 4,
+            "dtype": "uint8",
+            "crs": target_crs,
+            "transform": out_transform,
+            "compress": DELTA_COMPRESSION,
+            "tiled": True,
+            "blockxsize": DELTA_BLOCKSIZE,
+            "blockysize": DELTA_BLOCKSIZE,
+            "BIGTIFF": "IF_SAFER",
+            "nodata": None
+        }
+
+        with rasterio.open(output_path, "w", **profile) as dst:
+            try:
+                dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+            except Exception:
+                pass
+            for row in range(0, height, DELTA_BLOCKSIZE):
+                win_h = min(DELTA_BLOCKSIZE, height - row)
+                for col in range(0, width, DELTA_BLOCKSIZE):
+                    win_w = min(DELTA_BLOCKSIZE, width - col)
+                    out_window = Window(col, row, win_w, win_h)
+                    composite = np.zeros((4, win_h, win_w), dtype="uint8")
+                    out_bounds = rasterio.windows.bounds(out_window, out_transform)
+
+                    for warped_path in warped_paths:
+                        with rasterio.open(warped_path, "r") as src:
+                            try:
+                                src_window = rasterio.windows.from_bounds(*out_bounds, transform=src.transform)
+                                src_window = src_window.round_offsets().round_lengths()
+                                src_window = src_window.intersection(Window(0, 0, src.width, src.height))
+                            except Exception:
+                                continue
+                            if src_window.width <= 0 or src_window.height <= 0:
+                                continue
+                            data = src.read([1, 2, 3, 4], window=src_window, out_shape=(4, win_h, win_w), boundless=True, fill_value=0, resampling=Resampling.nearest)
+                            alpha = data[3] > 0
+                            if not alpha.any():
+                                continue
+                            opacity = int(float(next((si["layer"].get("opacity", 100) for si in source_items if si["path"] == src.name), 100) or 100))
+                            if opacity < 100:
+                                data[3] = ((data[3].astype("uint16") * max(0, min(100, opacity))) // 100).astype("uint8")
+                                alpha = data[3] > 0
+                            composite[:, alpha] = data[:, alpha]
+                    dst.write(composite, window=out_window)
+
+        logger.info("Smartpoint mosaic compositor finished: %s", output_path)
+        return output_path
 
     def create_mosaic_external_task(self, request, layers):
         export = self.create_mosaic_orthophoto_export(request, layers)

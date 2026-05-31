@@ -300,7 +300,7 @@
           opacity: Number(state.opacity[item.id] || 75) / 100,
           zIndex: z
         });
-        layer.on("tileerror", function () { updateStatus("Не вдалося завантажити тайли для: " + (item.task_name || item.id)); });
+        layer.on("tileerror", function () { console.warn("Smartpoint mosaic tile missing", item.task_name || item.id); });
         layer.addTo(map);
         layers.push(layer);
       }
@@ -320,18 +320,23 @@
   function createMosaic() {
     var selected = selectedOrderedItems();
     if (selected.length < 2) return updateStatus("Оберіть мінімум 2 ортофото.");
-    updateStatus("Створення об’єднаного ортофото...");
+    var payload = { layers: selected.map(function (item, index) {
+      return { task_id: item.id, project_id: item.project_id, opacity: Number(state.opacity[item.id] || 75), order: index };
+    }) };
+    console.log("Smartpoint mosaic create payload", payload);
+    updateStatus("Створення об’єднаного ортофото... Шарів: " + payload.layers.length);
     requestJson("/plugins/Smartpoint/api/mosaic/create/", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ layers: selected.map(function (item, index) {
-        return { task_id: item.id, project_id: item.project_id, opacity: Number(state.opacity[item.id] || 75), order: index };
-      }) })
+      body: JSON.stringify(payload)
     }).then(function (json) {
-      state.status = json.url ? "Готово.\n" + json.url : (json.message || "Запит виконано.");
+      console.log("Smartpoint mosaic create response", json);
+      state.status = json.message || "Об’єднане ортофото створено.";
+      if (json.task_name) state.status += "\nНова задача: " + json.task_name;
       render();
     }).catch(function (error) {
-      state.status = error.message || String(error);
+      console.error("Smartpoint mosaic create failed", error);
+      state.status = "Помилка створення мозаїки: " + (error.message || String(error));
       render();
     });
   }
