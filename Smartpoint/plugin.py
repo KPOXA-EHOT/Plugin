@@ -19,7 +19,7 @@ from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
-from app import models
+from app import models, pending_actions
 from app.api.common import check_project_perms, get_and_check_project
 from app.plugins import Menu, MountPoint, PluginBase
 from django.conf import settings
@@ -30,6 +30,9 @@ from django.shortcuts import render
 from django.utils.text import get_valid_filename
 from django.views.decorators.http import require_GET, require_POST
 from nodeodm.models import ProcessingNode
+from nodeodm import status_codes
+from worker import tasks as worker_tasks
+from django.db import transaction
 from PIL import Image, ImageFilter, ImageOps
 import rasterio
 from rasterio.crs import CRS
@@ -435,15 +438,17 @@ class Plugin(SmartAlignMixin, PluginBase):
         def mosaic_create(request):
             try:
                 payload = self.read_json_body(request)
-                export = self.create_mosaic_orthophoto_export(request, payload.get("layers", []))
+                result = self.create_mosaic_external_task(request, payload.get("layers", []))
                 return JsonResponse({
                     "success": True,
-                    "url": "/plugins/{}/api/mosaic/{}/download/".format(self.get_name(), export["id"]),
-                    "filename": export["filename"],
-                    "layers": export.get("layers", [])
+                    "task_id": str(result["task_id"]),
+                    "project_id": str(result["project_id"]),
+                    "task_name": result["task_name"],
+                    "redirect_url": "/dashboard/?project_task_open={}".format(result["project_id"]),
+                    "message": "Об’єднане ортофото додано в проект як External Data."
                 })
             except ValueError as e:
-                logger.exception("Smartpoint mosaic export failed")
+                logger.exception("Smartpoint mosaic external import failed")
                 return HttpResponseBadRequest(str(e))
 
 
@@ -989,77 +994,148 @@ class Plugin(SmartAlignMixin, PluginBase):
             raise ValueError("Оберіть мінімум 2 ортофото")
 
         ordered_layers = sorted(layers, key=lambda item: int(item.get("order", 0) if isinstance(item, dict) else 0))
-        sources = []
+        input_paths = []
         public_layers = []
-        opened = []
+        project_ids = set()
 
-        try:
-            for item in ordered_layers:
-                if not isinstance(item, dict):
-                    continue
-                task_id = str(item.get("task_id") or "").strip()
-                project_id = str(item.get("project_id") or "").strip()
-                if not task_id or not project_id:
-                    raise ValueError("Некоректний шар ортофото")
-                task = self.get_export_task(request, project_id, task_id)
-                source_path = self.get_delta_orthophoto_source(task)
-                dataset = rasterio.open(source_path)
-                if not dataset.crs:
-                    dataset.close()
+        for item in ordered_layers:
+            if not isinstance(item, dict):
+                continue
+            task_id = str(item.get("task_id") or "").strip()
+            project_id = str(item.get("project_id") or "").strip()
+            if not task_id or not project_id:
+                raise ValueError("Некоректний шар ортофото")
+
+            task = self.get_export_task(request, project_id, task_id)
+            source_path = self.get_delta_orthophoto_source(task)
+            with rasterio.open(source_path, "r") as dataset:
+                if dataset.crs is None:
                     raise ValueError("Ортофото '{}' не має CRS".format(task.name or task.id))
-                opened.append(dataset)
-                sources.append(dataset)
-                public_layers.append({
-                    "project_id": str(task.project_id),
-                    "task_id": str(task.id),
-                    "task_name": task.name or "",
-                    "opacity": int(float(item.get("opacity", 100) or 100)),
-                    "order": int(item.get("order", 0) or 0)
-                })
+                if dataset.width <= 0 or dataset.height <= 0:
+                    raise ValueError("Ортофото '{}' має некоректний розмір".format(task.name or task.id))
 
-            if len(sources) < 2:
-                raise ValueError("Оберіть мінімум 2 доступні ортофото")
-
-            merged_data, merged_transform = rio_merge(sources, method="last")
-            profile = sources[0].profile.copy()
-            profile.update({
-                "driver": "GTiff",
-                "height": int(merged_data.shape[1]),
-                "width": int(merged_data.shape[2]),
-                "transform": merged_transform,
-                "count": int(merged_data.shape[0]),
-                "compress": "deflate",
-                "tiled": True,
-                "BIGTIFF": "IF_SAFER"
+            input_paths.append(source_path)
+            project_ids.add(str(task.project_id))
+            public_layers.append({
+                "project_id": str(task.project_id),
+                "task_id": str(task.id),
+                "task_name": task.name or "",
+                "opacity": int(float(item.get("opacity", 100) or 100)),
+                "order": int(item.get("order", 0) or 0)
             })
 
-            export_id = str(uuid.uuid4())
-            export_dir = self.delta_export_dir(export_id)
-            os.makedirs(export_dir, exist_ok=True)
-            filename = "merged_orthophoto_{}.tif".format(datetime.utcnow().strftime("%Y%m%d_%H%M%S"))
-            output_path = safe_child(export_dir, filename)
+        if len(input_paths) < 2:
+            raise ValueError("Оберіть мінімум 2 доступні ортофото")
+        if len(project_ids) != 1:
+            raise ValueError("Для імпорту в проект оберіть ортофото з одного проекту")
 
-            with rasterio.open(output_path, "w", **profile) as dst:
-                dst.write(merged_data)
+        export_id = str(uuid.uuid4())
+        export_dir = self.delta_export_dir(export_id)
+        os.makedirs(export_dir, exist_ok=True)
+        filename = "merged_orthophoto_{}.tif".format(datetime.utcnow().strftime("%Y%m%d_%H%M%S"))
+        vrt_path = safe_child(export_dir, "merged_orthophoto.vrt")
+        output_path = safe_child(export_dir, filename)
 
-            export = {
-                "id": export_id,
-                "kind": "mosaic_orthophoto",
-                "path": output_path,
-                "filename": filename,
-                "content_type": "image/tiff",
-                "layers": public_layers,
-                "created_at": datetime.utcnow().isoformat()
-            }
-            with open(self.delta_export_json_path(export_id), "w", encoding="utf-8") as f:
-                json.dump(export, f, ensure_ascii=False, indent=2)
-            return export
-        finally:
-            for dataset in opened:
-                try:
-                    dataset.close()
-                except Exception:
-                    pass
+        gdalbuildvrt = self.find_gdal_tool("gdalbuildvrt")
+        gdal_translate = self.find_gdal_tool("gdal_translate")
+
+        vrt_args = [
+            gdalbuildvrt,
+            "-overwrite",
+            "-resolution", "highest",
+            "-r", "nearest",
+            vrt_path,
+        ] + input_paths
+        self.run_gdal(vrt_args)
+
+        with rasterio.open(vrt_path, "r") as vrt:
+            if vrt.crs is None:
+                raise ValueError("Об’єднаний VRT не має CRS")
+            pixel_count = int(vrt.width) * int(vrt.height)
+            if pixel_count > 2500000000:
+                raise ValueError(
+                    "Об’єднане ортофото занадто велике: {} x {} px. "
+                    "Ймовірно, ортофото мають різну CRS/масштаб або знаходяться дуже далеко одне від одного.".format(vrt.width, vrt.height)
+                )
+
+        translate_args = [
+            gdal_translate,
+            "-of", "COG",
+            "-co", "BLOCKSIZE={}".format(DELTA_BLOCKSIZE),
+            "-co", "COMPRESS={}".format(DELTA_COMPRESSION),
+            "-co", "PREDICTOR=2",
+            "-co", "BIGTIFF=IF_SAFER",
+            "-co", "NUM_THREADS=ALL_CPUS",
+            "--config", "GDAL_NUM_THREADS", "ALL_CPUS",
+            "--config", "GDAL_TIFF_INTERNAL_MASK", "YES",
+            vrt_path,
+            output_path,
+        ]
+        self.run_gdal(translate_args)
+
+        export = {
+            "id": export_id,
+            "kind": "mosaic_orthophoto",
+            "path": output_path,
+            "filename": filename,
+            "content_type": "image/tiff",
+            "layers": public_layers,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        with open(self.delta_export_json_path(export_id), "w", encoding="utf-8") as f:
+            json.dump(export, f, ensure_ascii=False, indent=2)
+        return export
+
+
+    def create_mosaic_external_task(self, request, layers):
+        export = self.create_mosaic_orthophoto_export(request, layers)
+        export_path = export.get("path")
+        if not export_path or not os.path.isfile(export_path):
+            raise ValueError("Merged orthophoto was not created")
+
+        public_layers = export.get("layers") or []
+        if not public_layers:
+            raise ValueError("No mosaic layers found")
+
+        project_ids = {str(layer.get("project_id")) for layer in public_layers if layer.get("project_id")}
+        if len(project_ids) != 1:
+            raise ValueError("Для імпорту в проект оберіть ортофото з одного проекту")
+        project_id = project_ids.pop()
+
+        try:
+            project = get_and_check_project(request, project_id, ("change_project",))
+        except Exception as e:
+            raise ValueError("Немає прав на зміну проекту: {}".format(e))
+
+        with rasterio.open(export_path, "r") as dataset:
+            if dataset.crs is None:
+                raise ValueError("Об’єднаний GeoTIFF не має CRS")
+
+        task_name = "Merged orthophoto {}".format(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+
+        with transaction.atomic():
+            task = models.Task.objects.create(
+                project=project,
+                auto_processing_node=False,
+                name=task_name,
+                import_url="file://external",
+                status=status_codes.RUNNING,
+                pending_action=pending_actions.IMPORT
+            )
+            task.create_task_directories()
+            destination_path = task.get_asset_download_path("orthophoto.tif")
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            shutil.copy2(export_path, destination_path)
+
+        worker_tasks.process_task.delay(task.id)
+
+        return {
+            "task_id": task.id,
+            "project_id": task.project_id,
+            "task_name": task.name,
+            "source_export_id": export.get("id"),
+            "layers": public_layers
+        }
 
     def find_delta_3d_obj2tiles(self):
         webodm_root = Path(settings.BASE_DIR)
