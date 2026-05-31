@@ -75,6 +75,200 @@
     return cookieValue;
   }
 
+
+  var DELTA_EXPORT_OPTIONS_PREFIX = "soft_tools_delta_export_options_";
+
+  function safeParseJson(value) {
+    try { return JSON.parse(value); } catch (_) { return null; }
+  }
+
+  function parsePossibleExportBody(body) {
+    var data = {};
+    if (!body) return data;
+
+    if (typeof body === "object") {
+      try {
+        if (typeof FormData !== "undefined" && body instanceof FormData) {
+          body.forEach(function (value, key) { data[key] = value; });
+          return data;
+        }
+      } catch (_) {}
+
+      try {
+        if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+          body.forEach(function (value, key) { data[key] = value; });
+          return data;
+        }
+      } catch (_) {}
+
+      try {
+        if (!(body instanceof Blob) && !(body instanceof ArrayBuffer)) {
+          for (var key in body) {
+            if (Object.prototype.hasOwnProperty.call(body, key)) {
+              data[key] = body[key];
+            }
+          }
+          return data;
+        }
+      } catch (_) {}
+    }
+
+    if (typeof body === "string") {
+      var parsed = safeParseJson(body);
+      if (parsed && typeof parsed === "object") return parsed;
+
+      try {
+        var params = new URLSearchParams(body);
+        params.forEach(function (value, key) { data[key] = value; });
+      } catch (_) {}
+    }
+
+    return data;
+  }
+
+  function getProjectTaskFromUrl(url) {
+    var raw = String(url || "");
+    var match = raw.match(/\/api\/projects\/([^/]+)\/tasks\/([^/?#]+)/);
+    if (!match) {
+      match = raw.match(/\/api\/projects\/([^/]+)\/tasks\/([^/]+)\/download\/orthophoto\.tif/);
+    }
+    if (!match) return null;
+    return {
+      projectId: decodeURIComponent(match[1]),
+      taskId: decodeURIComponent(match[2])
+    };
+  }
+
+  function normalizeCapturedExportOptions(options) {
+    if (!options || typeof options !== "object") return null;
+
+    if (typeof options.export_options === "string") {
+      var parsedExportOptions = safeParseJson(options.export_options);
+      if (parsedExportOptions && typeof parsedExportOptions === "object") {
+        options.export_options = parsedExportOptions;
+      }
+    }
+
+    var nested = options.export_options && typeof options.export_options === "object"
+      ? options.export_options
+      : options;
+
+    var crop = nested.crop || options.crop || "";
+    if (!crop) {
+      for (var prop in options) {
+        if (!Object.prototype.hasOwnProperty.call(options, prop)) continue;
+        var value = options[prop];
+        if (typeof value === "string" && value.toUpperCase().indexOf("POLYGON") === 0) {
+          crop = value;
+          break;
+        }
+      }
+    }
+
+    var assetType = nested.asset_type || options.asset_type || "";
+    var format = nested.format || options.format || "";
+
+    var looksLikeOrthophoto =
+      String(assetType || "").toLowerCase() === "orthophoto" ||
+      String(format || "").toLowerCase() === "gtiff" ||
+      String(crop || "").toUpperCase().indexOf("POLYGON") === 0;
+
+    if (!looksLikeOrthophoto) return null;
+
+    var result = {};
+    var keys = ["epsg", "proj", "expression", "format", "rescale", "color_map", "hillshade", "asset_type", "name", "crop"];
+    for (var i = 0; i < keys.length; i += 1) {
+      var key = keys[i];
+      if (nested[key] !== undefined && nested[key] !== null && nested[key] !== "") {
+        result[key] = nested[key];
+      } else if (options[key] !== undefined && options[key] !== null && options[key] !== "") {
+        result[key] = options[key];
+      }
+    }
+
+    if (crop && !result.crop) result.crop = crop;
+    if (!result.asset_type) result.asset_type = "orthophoto";
+    if (!result.format) result.format = "gtiff";
+
+    return result;
+  }
+
+  function storeDeltaExportOptions(context, options) {
+    if (!context || !context.projectId || !context.taskId || !options) return;
+    try {
+      var key = DELTA_EXPORT_OPTIONS_PREFIX + context.projectId + "_" + context.taskId;
+      window.localStorage.setItem(key, JSON.stringify(options));
+    } catch (_) {}
+  }
+
+  function loadDeltaExportOptions(context) {
+    if (!context || !context.projectId || !context.taskId) return {};
+    try {
+      var key = DELTA_EXPORT_OPTIONS_PREFIX + context.projectId + "_" + context.taskId;
+      var parsed = safeParseJson(window.localStorage.getItem(key) || "");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function captureStandardRasterExport(url, body) {
+    var context = getProjectTaskFromUrl(url) || deltaExportContext;
+    var parsed = parsePossibleExportBody(body);
+    var normalized = normalizeCapturedExportOptions(parsed);
+    if (context && normalized) storeDeltaExportOptions(context, normalized);
+  }
+
+  function installDeltaExportCaptureHooks() {
+    if (window.__softToolsDeltaExportCaptureInstalled) return;
+    window.__softToolsDeltaExportCaptureInstalled = true;
+
+    if (window.fetch) {
+      var originalFetch = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          var url = typeof input === "string" ? input : (input && input.url);
+          var body = init && init.body;
+          if (body) captureStandardRasterExport(url, body);
+        } catch (_) {}
+        return originalFetch.apply(this, arguments);
+      };
+    }
+
+    if (window.XMLHttpRequest && window.XMLHttpRequest.prototype) {
+      var originalOpen = window.XMLHttpRequest.prototype.open;
+      var originalSend = window.XMLHttpRequest.prototype.send;
+
+      window.XMLHttpRequest.prototype.open = function (method, url) {
+        this.__softToolsDeltaExportUrl = url;
+        return originalOpen.apply(this, arguments);
+      };
+
+      window.XMLHttpRequest.prototype.send = function (body) {
+        try {
+          captureStandardRasterExport(this.__softToolsDeltaExportUrl, body);
+        } catch (_) {}
+        return originalSend.apply(this, arguments);
+      };
+    }
+
+    if (window.jQuery && window.jQuery.ajax) {
+      var originalAjax = window.jQuery.ajax;
+      window.jQuery.ajax = function (urlOrOptions, maybeOptions) {
+        try {
+          var ajaxOptions = typeof urlOrOptions === "object" ? urlOrOptions : (maybeOptions || {});
+          var ajaxUrl = typeof urlOrOptions === "string" ? urlOrOptions : ajaxOptions.url;
+          if (ajaxOptions && ajaxOptions.data) {
+            captureStandardRasterExport(ajaxUrl, ajaxOptions.data);
+          }
+        } catch (_) {}
+        return originalAjax.apply(this, arguments);
+      };
+    }
+  }
+
+  installDeltaExportCaptureHooks();
+
   var deltaExportContext = null;
   var delta3dExportContext = null;
 
@@ -135,6 +329,25 @@
     button.disabled = true;
     button.innerHTML = '<i class="fa fa-spinner fa-spin"></i> Delta...';
 
+    var deltaOptions = loadDeltaExportOptions(deltaExportContext);
+
+    // Last fallback: collect visible export modal fields.
+    try {
+      var modal = button.closest ? button.closest(".export-asset-dialog, .modal-dialog, .modal") : null;
+      if (modal) {
+        var fields = modal.querySelectorAll("input, select, textarea");
+        for (var i = 0; i < fields.length; i += 1) {
+          var field = fields[i];
+          var key = field.getAttribute("name") || field.getAttribute("id");
+          if (!key) continue;
+          if ((field.type === "checkbox" || field.type === "radio") && !field.checked) continue;
+          if (field.value !== undefined && field.value !== null && String(field.value) !== "") {
+            deltaOptions[key] = field.value;
+          }
+        }
+      }
+    } catch (_) {}
+
     fetch(
       "/plugins/Smartpoint/api/projects/" +
         encodeURIComponent(deltaExportContext.projectId) +
@@ -145,8 +358,10 @@
         method: "POST",
         credentials: "same-origin",
         headers: {
-          "X-CSRFToken": getCookieValue("csrftoken") || ""
-        }
+          "X-CSRFToken": getCookieValue("csrftoken") || "",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(deltaOptions || {})
       }
     ).then(function (response) {
       if (!response.ok) {

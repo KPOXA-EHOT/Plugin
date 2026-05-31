@@ -9,6 +9,7 @@ import uuid
 import gzip
 import hashlib
 import html
+import math
 import struct
 import tempfile
 import zipfile
@@ -675,7 +676,7 @@ class SmartAlignMixin(object):
                 if payload.get("points"):
                     result = self.align_3d_model_from_points(task, payload.get("points") or [])
                 else:
-                    result = self.align_3d_model(task)
+                    result = self.align_3d_model(task, payload.get("placement") or {})
                 return JsonResponse({"success": True, "alignment_3d": result})
             except ValueError as e:
                 return HttpResponseBadRequest(str(e))
@@ -1027,10 +1028,13 @@ class SmartAlignMixin(object):
 
         viewer = None
         if obj.get("exists") and obj.get("name"):
+            mtllib = self.read_obj_mtllib(self.find_original_3d_obj_source(task))
             viewer = {
                 "obj_url": self.api_url(task, "source-3d/{}".format(obj.get("name"))),
                 "resource_url": self.api_url(task, "source-3d/"),
-                "name": obj.get("name")
+                "name": obj.get("name"),
+                "mtl_path": mtllib,
+                "mtl_url": self.api_url(task, "source-3d/{}".format(mtllib)) if mtllib else ""
             }
 
         return {
@@ -1217,6 +1221,17 @@ class SmartAlignMixin(object):
             "exists": False,
             "missing": missing
         }
+
+    def read_obj_mtllib(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.lower().startswith("mtllib "):
+                        return stripped[7:].strip()
+        except Exception:
+            return ""
+        return ""
 
     def inspect_raster_asset(self, path):
         with rasterio.open(path) as dataset:
@@ -1755,7 +1770,7 @@ class SmartAlignMixin(object):
         return self.write_aligned_obj_with_mapper(
             source_obj,
             output_obj,
-            lambda x, y: transform_xy(xy_transform, x, y)
+            lambda x, y, z: transform_xy(xy_transform, x, y)
         )
 
     def write_aligned_obj_with_mapper(self, source_obj, output_obj, xy_mapper):
@@ -1770,8 +1785,13 @@ class SmartAlignMixin(object):
                     dst.write(line)
                     continue
                 x, y, z, rest = vertex
-                new_x, new_y = xy_mapper(x, y)
-                values = ["v", format_coord(new_x), format_coord(new_y), format_coord(z)]
+                mapped = xy_mapper(x, y, z)
+                if len(mapped) >= 3:
+                    new_x, new_y, new_z = mapped[:3]
+                else:
+                    new_x, new_y = mapped[:2]
+                    new_z = z
+                values = ["v", format_coord(new_x), format_coord(new_y), format_coord(new_z)]
                 values.extend(rest)
                 dst.write(" ".join(values) + "\n")
                 vertex_count += 1
@@ -2122,6 +2142,58 @@ class SmartAlignMixin(object):
                 "error": str(e)
             }
 
+    def find_odm_dem_asset(self, task):
+        candidates = [
+            ("dtm", task.assets_path("odm_dem", "dtm.tif")),
+            ("dsm", task.assets_path("odm_dem", "dsm.tif")),
+        ]
+        for kind, path in candidates:
+            if os.path.isfile(path):
+                return kind, path
+        return None, None
+
+    def get_odm_dem_elevation(self, task, map_x, map_y, crs_text):
+        dem_kind, dem_path = self.find_odm_dem_asset(task)
+        if not dem_path:
+            return None
+        with rasterio.open(dem_path) as dataset:
+            sample_x = float(map_x)
+            sample_y = float(map_y)
+            if dataset.crs and crs_text and dataset.crs.to_string() != crs_text:
+                xs, ys = rio_transform(CRS.from_string(crs_text), dataset.crs, [sample_x], [sample_y])
+                sample_x = float(xs[0])
+                sample_y = float(ys[0])
+            row, col = dataset.index(sample_x, sample_y)
+            if row < 0 or col < 0 or row >= dataset.height or col >= dataset.width:
+                return None
+            value = next(dataset.sample([(sample_x, sample_y)], masked=True))[0]
+            if np.ma.is_masked(value):
+                return None
+            elevation = float(value)
+            if not np.isfinite(elevation):
+                return None
+            nodata = dataset.nodata
+            if nodata is not None and abs(elevation - float(nodata)) < 0.000001:
+                return None
+            return {
+                "available": True,
+                "provider": "ODM {}".format(dem_kind.upper()),
+                "elevation": elevation,
+                "path": dem_path,
+                "crs": dataset.crs.to_string() if dataset.crs else "",
+                "sample": {"x": sample_x, "y": sample_y}
+            }
+
+    def get_3d_origin_terrain_reference(self, task, map_x, map_y, crs_text, latitude, longitude):
+        try:
+            dem = self.get_odm_dem_elevation(task, map_x, map_y, crs_text)
+            if dem:
+                dem["fallback"] = ""
+                return dem
+        except Exception as e:
+            logger.warning("SmartAlign could not sample ODM DEM for 3D origin: %s", e)
+        return self.get_delta_3d_terrain_reference(latitude, longitude)
+
     def percentile_value(self, values, percent):
         if not values:
             return 0.0
@@ -2175,7 +2247,7 @@ class SmartAlignMixin(object):
             latitude = float(lat_values[0])
         except Exception as e:
             raise ValueError("Could not convert SmartAlign 3D center to WGS84: {}".format(e))
-        terrain = self.get_delta_3d_terrain_reference(latitude, longitude)
+        terrain = self.get_3d_origin_terrain_reference(task, center_x, center_y, crs_text, latitude, longitude)
 
         source_dir = os.path.dirname(str(source_path))
         prepared_dir = safe_child(delta_dir, "source")
@@ -2337,7 +2409,52 @@ class SmartAlignMixin(object):
             public["delta_3d"].pop("source_obj", None)
         return public
 
-    def align_3d_model(self, task):
+    def normalize_3d_placement(self, placement):
+        if not isinstance(placement, dict):
+            placement = {}
+
+        def number(name, default, minimum=None, maximum=None):
+            try:
+                value = float(placement.get(name, default))
+            except (TypeError, ValueError):
+                value = float(default)
+            if minimum is not None:
+                value = max(float(minimum), value)
+            if maximum is not None:
+                value = min(float(maximum), value)
+            return value
+
+        return {
+            "offset_x": number("offset_x", 0.0, -10000, 10000),
+            "offset_y": number("offset_y", 0.0, -10000, 10000),
+            "offset_z": number("offset_z", 0.0, -10000, 10000),
+            "yaw_deg": number("yaw_deg", 0.0, -180, 180),
+            "scale": number("scale", 1.0, 0.01, 100.0)
+        }
+
+    def placed_3d_mapper(self, base_mapper, placement, anchor_x, anchor_y):
+        placement = self.normalize_3d_placement(placement)
+        yaw = math.radians(float(placement.get("yaw_deg") or 0.0))
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        scale = float(placement.get("scale") or 1.0)
+        offset_x = float(placement.get("offset_x") or 0.0)
+        offset_y = float(placement.get("offset_y") or 0.0)
+        offset_z = float(placement.get("offset_z") or 0.0)
+
+        def mapper(x, y, z):
+            mapped_x, mapped_y = base_mapper(x, y)
+            dx = (float(mapped_x) - anchor_x) * scale
+            dy = (float(mapped_y) - anchor_y) * scale
+            return (
+                anchor_x + dx * cos_yaw - dy * sin_yaw + offset_x,
+                anchor_y + dx * sin_yaw + dy * cos_yaw + offset_y,
+                float(z) + offset_z
+            )
+
+        return mapper, placement
+
+    def align_3d_model(self, task, placement=None):
         alignment = self.load_alignment(task)
         if not alignment:
             raise ValueError("Спочатку створіть aligned GeoTIFF")
@@ -2374,11 +2491,25 @@ class SmartAlignMixin(object):
                 method = "local_orthophoto_bridge"
                 xy_mapper = self.local_orthophoto_to_map_mapper(bridge, alignment)
 
+        obj_bounds = obj_inspection.get("bounds") or [0, 0, 0, 0]
+        try:
+            anchor_source_x = (float(obj_bounds[0]) + float(obj_bounds[2])) / 2.0
+            anchor_source_y = (float(obj_bounds[1]) + float(obj_bounds[3])) / 2.0
+            anchor_x, anchor_y = xy_mapper(anchor_source_x, anchor_source_y)
+        except Exception:
+            anchor_x = anchor_y = 0.0
+        placed_mapper, normalized_placement = self.placed_3d_mapper(
+            xy_mapper,
+            placement or {},
+            float(anchor_x),
+            float(anchor_y)
+        )
+
         output_dir = safe_child(self.smartalign_dir(task), "model_aligned")
         os.makedirs(output_dir, exist_ok=True)
 
         output_obj = safe_child(output_dir, "odm_textured_model_smartalign.obj")
-        vertex_count = self.write_aligned_obj_with_mapper(source_obj, output_obj, xy_mapper)
+        vertex_count = self.write_aligned_obj_with_mapper(source_obj, output_obj, placed_mapper)
         copied_sidecars = self.copy_obj_sidecars(source_obj, output_dir)
         output_zip = safe_child(self.smartalign_dir(task), "model_aligned_obj.zip")
         self.zip_directory(output_dir, output_zip)
@@ -2395,6 +2526,8 @@ class SmartAlignMixin(object):
             "z_policy": "preserved",
             "crs": alignment.get("crs"),
             "xy_transform": list(xy_transform)[:6] if xy_transform else None,
+            "placement": normalized_placement,
+            "placement_anchor": {"x": float(anchor_x), "y": float(anchor_y)},
             "coords_offset": coords_offset,
             "orthophoto_bridge": bridge,
             "sidecar_count": len(copied_sidecars),
@@ -2422,16 +2555,22 @@ class SmartAlignMixin(object):
         if not crs_text:
             raise ValueError("SmartAlign 3D alignment has no CRS")
 
+        aligned_obj = alignment_3d.get("output_path") or safe_child(
+            self.smartalign_dir(task),
+            "model_aligned",
+            "odm_textured_model_smartalign.obj"
+        )
         source_obj = original_obj
         sidecar_source_obj = original_obj
         xy_mapper = None
         z_scale = 1.0
-        if alignment_3d.get("method") == "manual_similarity_3d":
-            aligned_obj = alignment_3d.get("output_path")
-            if not aligned_obj or not os.path.isfile(aligned_obj):
-                raise ValueError("SmartAlign 3D aligned OBJ is not available")
+        if aligned_obj and os.path.isfile(aligned_obj):
             source_obj = aligned_obj
             xy_mapper = lambda x, y: (float(x), float(y))
+        elif alignment_3d.get("method") == "manual_similarity_3d":
+            if not aligned_obj:
+                raise ValueError("SmartAlign 3D aligned OBJ is not available")
+            raise ValueError("SmartAlign 3D aligned OBJ is not available")
         else:
             xy_mapper, z_scale = self.softtools_3d_mapper_and_scale(task, source_obj, alignment_3d)
 
@@ -2467,7 +2606,7 @@ class SmartAlignMixin(object):
             latitude = float(lat_values[0])
         except Exception as e:
             raise ValueError("Could not convert SmartAlign 3D origin to WGS84: {}".format(e))
-        terrain = self.get_delta_3d_terrain_reference(latitude, longitude)
+        terrain = self.get_3d_origin_terrain_reference(task, origin_x, origin_y, crs_text, latitude, longitude)
 
         root_dir = safe_child(self.smartalign_dir(task), "softtools_3d")
         webodm_dir = safe_child(root_dir, "webodm_model")

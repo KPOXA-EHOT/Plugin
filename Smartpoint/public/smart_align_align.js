@@ -14,10 +14,13 @@
   var threeCamera = null;
   var threeRenderer = null;
   var threeControls = null;
+  var threeTransformControls = null;
   var threeModel = null;
+  var threeGround = null;
   var threeRaycaster = null;
   var threePointer = null;
   var threeAnimation = null;
+  var suppressNext3dPick = false;
   var BASE_MAP_NAMES = [
     "Esri Satellite", "Esri Streets", "Esri Topo", "Esri Terrain", "Esri NatGeo",
     "Esri Light Gray", "Esri Dark Gray", "OpenStreetMap", "OpenStreetMap HOT",
@@ -47,6 +50,8 @@
     mapInitialFitDone: false,
     previewVisible: true,
     assetWriteDirty: false,
+    placement3d: { offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 },
+    transformMode3d: "translate",
     threeLoaded: false,
     threeError: ""
   };
@@ -115,14 +120,14 @@
   }
 
   function ensureThree() {
-    if (window.THREE && window.THREE.OBJLoader && window.THREE.OrbitControls) {
+    if (window.THREE && window.THREE.OBJLoader && window.THREE.MTLLoader && window.THREE.OrbitControls && window.THREE.TransformControls) {
       return Promise.resolve();
     }
     if (threeLoading) {
       return new Promise(function (resolve, reject) {
         var started = Date.now();
         function wait() {
-          if (window.THREE && window.THREE.OBJLoader && window.THREE.OrbitControls) resolve();
+          if (window.THREE && window.THREE.OBJLoader && window.THREE.MTLLoader && window.THREE.OrbitControls && window.THREE.TransformControls) resolve();
           else if (Date.now() - started > 15000) reject(new Error("3D viewer не завантажився"));
           else window.setTimeout(wait, 100);
         }
@@ -132,6 +137,8 @@
     threeLoading = true;
     return loadScriptOnce("https://unpkg.com/three@0.128.0/build/three.min.js")
       .then(function () { return loadScriptOnce("https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"); })
+      .then(function () { return loadScriptOnce("https://unpkg.com/three@0.128.0/examples/js/controls/TransformControls.js"); })
+      .then(function () { return loadScriptOnce("https://unpkg.com/three@0.128.0/examples/js/loaders/MTLLoader.js"); })
       .then(function () { return loadScriptOnce("https://unpkg.com/three@0.128.0/examples/js/loaders/OBJLoader.js"); })
       .then(function () {
         state.threeLoaded = true;
@@ -396,27 +403,58 @@
     return number.toFixed(digits == null ? 3 : digits);
   }
 
+  function normalize3dPlacement(placement) {
+    placement = placement || {};
+    function number(name, fallback, min, max) {
+      var value = Number(placement[name]);
+      if (!Number.isFinite(value)) value = fallback;
+      if (min != null) value = Math.max(min, value);
+      if (max != null) value = Math.min(max, value);
+      return value;
+    }
+    return {
+      offset_x: number("offset_x", 0, -10000, 10000),
+      offset_y: number("offset_y", 0, -10000, 10000),
+      offset_z: number("offset_z", 0, -10000, 10000),
+      yaw_deg: number("yaw_deg", 0, -180, 180),
+      scale: number("scale", 1, 0.01, 100)
+    };
+  }
+
+  function set3dPlacement(patch) {
+    state.placement3d = normalize3dPlacement(Object.assign({}, state.placement3d || {}, patch || {}));
+    apply3dPlacementPreview();
+  }
+
   function render3dViewerPanel() {
     var threeD = state.info && state.info.three_d || {};
     var viewer = threeD.viewer || {};
-    var active = ensure3dPoint(state.activePoint);
-    var mesh = active.mesh;
-    var status = mesh
-      ? "Mesh XYZ: " + [mesh.x, mesh.y, mesh.z].map(function (value) { return formatNumber(value, 3); }).join(", ")
-      : "Клікніть по 3D моделі для mesh XYZ";
+    var placement = state.placement3d || {};
+    var status = "3D від ортофото: X " + formatNumber(placement.offset_x || 0, 2) +
+      " м, Y " + formatNumber(placement.offset_y || 0, 2) +
+      " м, Z " + formatNumber(placement.offset_z || 0, 2) +
+      " м, поворот " + formatNumber(placement.yaw_deg || 0, 1) +
+      "°, масштаб " + formatNumber(placement.scale || 1, 3);
     return '' +
       '<section class="smartalign-panel">' +
-        '<div class="smartalign-panel-head">' +
-          '<div>' + render3dPointCounter() + '</div>' +
-          '<div class="smartalign-panel-actions">' +
-            '<button type="button" class="btn btn-default smartalign-icon-button smartalign-3d-add-point" title="Додати 3D точку"><i class="fa fa-plus"></i></button>' +
-          '</div>' +
-        '</div>' +
         '<div class="smartalign-3d-stage">' +
-          '<div id="smartalign-3d-viewer" class="smartalign-3d-viewer" data-obj-url="' + escapeHtml(viewer.obj_url || "") + '"></div>' +
+          '<div id="smartalign-3d-viewer" class="smartalign-3d-viewer" data-obj-url="' + escapeHtml(viewer.obj_url || "") + '" data-resource-url="' + escapeHtml(viewer.resource_url || "") + '" data-mtl-path="' + escapeHtml(viewer.mtl_path || "") + '"></div>' +
           '<div class="smartalign-3d-status">' + escapeHtml(state.threeError || status) + '</div>' +
         '</div>' +
       '</section>';
+  }
+
+  function render3dTransformToolbar() {
+    return '' +
+      '<div class="smartalign-3d-toolbar-controls">' +
+        '<div class="smartalign-3d-gizmo-tools">' +
+          '<button type="button" class="btn btn-default btn-xs' + (state.transformMode3d === "translate" ? " active" : "") + '" data-3d-transform-mode="translate">Рух</button>' +
+          '<button type="button" class="btn btn-default btn-xs' + (state.transformMode3d === "rotate" ? " active" : "") + '" data-3d-transform-mode="rotate">Поворот</button>' +
+          '<button type="button" class="btn btn-default btn-xs' + (state.transformMode3d === "scale" ? " active" : "") + '" data-3d-transform-mode="scale">Масштаб</button>' +
+        '</div>' +
+        render3dPlacementControls() +
+        '<button type="button" class="btn btn-default smartalign-icon-button" id="smartalign-3d-reset-placement" title="Скинути 3D підгонку"><i class="fa fa-refresh"></i></button>' +
+      '</div>';
   }
 
   function render3dPointTable() {
@@ -445,11 +483,42 @@
       '</div>';
   }
 
+  function render3dPlacementControls() {
+    var placement = Object.assign({ offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 }, state.placement3d || {});
+    function input(name, label, step) {
+      return '' +
+        '<label class="smartalign-3d-placement-field">' +
+          '<span>' + label + '</span>' +
+          '<input type="number" step="' + step + '" data-3d-placement="' + name + '" value="' + escapeHtml(placement[name]) + '">' +
+        '</label>';
+    }
+    return '' +
+      '<div class="smartalign-3d-placement">' +
+        '<div class="smartalign-3d-placement-grid">' +
+          input("offset_x", "X м", "0.1") +
+          input("offset_y", "Y м", "0.1") +
+          input("offset_z", "Z м", "0.1") +
+          input("yaw_deg", "Поворот °", "0.1") +
+          input("scale", "Масштаб", "0.001") +
+        '</div>' +
+        '<div class="smartalign-3d-nudge">' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_y:1">Y +</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_y:-1">Y -</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_x:-1">X -</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_x:1">X +</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_z:1">Z +</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="offset_z:-1">Z -</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="yaw_deg:-1">↺</button>' +
+          '<button type="button" class="btn btn-default btn-xs" data-3d-nudge="yaw_deg:1">↻</button>' +
+        '</div>' +
+      '</div>';
+  }
+
   function render3dMapPanel() {
     var alignment = state.info && state.info.alignment_3d;
-    var resultStatus = alignment && alignment.method === "manual_similarity_3d"
-      ? '<div class="smartalign-map-status">3D RMS: ' + escapeHtml(formatNumber(alignment.rms_error_m || alignment.rmse, 3)) + ' м</div>'
-      : '<div class="smartalign-map-status">Клікніть ту саму точку на карті</div>';
+    var resultStatus = alignment
+      ? '<div class="smartalign-map-status">3D підготовлено: ' + escapeHtml(localize3dMode(alignment.method || "")) + '</div>'
+      : '<div class="smartalign-map-status">Базова 3D прив’язка береться з ортофото</div>';
     return '' +
       '<section class="smartalign-panel">' +
         '<div class="smartalign-panel-head">' +
@@ -464,7 +533,7 @@
           '</div>' +
         '</div>' +
         '<div id="smartalign-map" class="smartalign-map">' + (!window.L ? '<div class="smartalign-empty">Завантаження карти...</div>' : '') + '</div>' +
-        render3dPointTable() +
+        render3dPlacementControls() +
       '</section>';
   }
 
@@ -642,23 +711,29 @@
     }
 
     if (state.mode === "3d") {
+      if (map) {
+        map.remove();
+        map = null;
+        baseLayer = null;
+        alignedOverlay = null;
+        orthophotoLayer = null;
+        mapMarkers = [];
+      }
       root.innerHTML = '' +
         '<div class="smartalign-app">' +
           '<div class="smartalign-topbar">' +
             '<button type="button" class="btn btn-default smartalign-back" id="smartalign-back-ortho"><i class="fa fa-arrow-left"></i> Ортофото</button>' +
             '<div class="smartalign-toolbar">' +
-              '<button type="button" class="btn btn-default" id="smartalign-3d-add-point"><i class="fa fa-plus"></i> Точка</button>' +
-              '<button type="button" class="btn btn-primary" id="smartalign-3d-calculate" ' + (valid3dPairs().length >= 3 && !state.aligning3d ? "" : "disabled") + '><i class="fa fa-cube"></i> ' + (state.aligning3d ? "Розрахунок 3D..." : "Розрахувати 3D") + '</button>' +
+              '<button type="button" class="btn btn-primary" id="smartalign-3d-calculate" ' + ((state.info && state.info.alignment && !state.aligning3d) ? "" : "disabled") + '><i class="fa fa-cube"></i> ' + (state.aligning3d ? "Збереження..." : "Зберегти 3D") + '</button>' +
+              render3dTransformToolbar() +
               render3dAction() +
             '</div>' +
           '</div>' +
           '<div class="smartalign-workspace smartalign-workspace-3d">' +
             render3dViewerPanel() +
-            render3dMapPanel() +
           '</div>' +
         '</div>';
       bindEvents();
-      ensureLeafletThenSyncMap();
       init3dViewerWhenReady();
       return;
     }
@@ -742,11 +817,16 @@
     if (threeRenderer) {
       try { threeRenderer.dispose(); } catch (_) {}
     }
+    if (threeTransformControls) {
+      try { threeTransformControls.detach(); threeTransformControls.dispose(); } catch (_) {}
+    }
     threeScene = null;
     threeCamera = null;
     threeRenderer = null;
     threeControls = null;
+    threeTransformControls = null;
     threeModel = null;
+    threeGround = null;
     threeRaycaster = null;
     threePointer = null;
   }
@@ -760,14 +840,77 @@
       return;
     }
     ensureThree()
-      .then(function () { init3dViewer(container, objUrl); })
+      .then(function () {
+        init3dViewer(container, objUrl, container.getAttribute("data-resource-url") || "", container.getAttribute("data-mtl-path") || "");
+      })
       .catch(function (error) {
         state.threeError = error.message || String(error);
         render();
       });
   }
 
-  function init3dViewer(container, objUrl) {
+  function encodeResourcePath(path) {
+    return String(path || "").split("/").map(function (part) {
+      return encodeURIComponent(part);
+    }).join("/");
+  }
+
+  function joinResourceUrl(baseUrl, path) {
+    if (!baseUrl || !path) return "";
+    return baseUrl.replace(/\/?$/, "/") + encodeResourcePath(path);
+  }
+
+  function objLoaderPromise(loader, url) {
+    return new Promise(function (resolve, reject) {
+      loader.load(url, resolve, undefined, reject);
+    });
+  }
+
+  function load3dObjWithMaterials(objUrl, resourceUrl, mtlPath) {
+    var materialPathPromise = mtlPath
+      ? Promise.resolve(mtlPath)
+      : fetch(objUrl, { credentials: "same-origin" })
+        .then(function (response) {
+          if (!response.ok) return "";
+          return response.text();
+        })
+        .then(function (text) {
+          var match = text.match(/^\s*mtllib\s+(.+)$/mi);
+          return match ? match[1].trim() : "";
+        })
+        .catch(function () { return ""; });
+
+    return materialPathPromise.then(function (resolvedMtlPath) {
+      var objLoader = new THREE.OBJLoader();
+      if (!resolvedMtlPath || !resourceUrl || !window.THREE.MTLLoader) {
+        return objLoaderPromise(objLoader, objUrl);
+      }
+
+      var normalizedMtl = resolvedMtlPath.replace(/\\/g, "/");
+      var slash = normalizedMtl.lastIndexOf("/");
+      var mtlDir = slash >= 0 ? normalizedMtl.slice(0, slash + 1) : "";
+      var mtlFile = slash >= 0 ? normalizedMtl.slice(slash + 1) : normalizedMtl;
+      var mtlBaseUrl = joinResourceUrl(resourceUrl, mtlDir);
+      var mtlLoader = new THREE.MTLLoader();
+      mtlLoader.setCrossOrigin("anonymous");
+      mtlLoader.setPath(mtlBaseUrl || resourceUrl);
+      mtlLoader.setResourcePath(mtlBaseUrl || resourceUrl);
+
+      return new Promise(function (resolve) {
+        mtlLoader.load(encodeResourcePath(mtlFile), function (materials) {
+          materials.preload();
+          objLoader.setMaterials(materials);
+          resolve(objLoaderPromise(objLoader, objUrl));
+        }, undefined, function () {
+          resolve(objLoaderPromise(objLoader, objUrl));
+        });
+      }).then(function (loaded) {
+        return loaded;
+      });
+    });
+  }
+
+  function init3dViewer(container, objUrl, resourceUrl, mtlPath) {
     dispose3dViewer();
     state.threeError = "";
     var width = Math.max(320, container.clientWidth || 640);
@@ -791,22 +934,54 @@
     var directional = new THREE.DirectionalLight(0xffffff, 0.8);
     directional.position.set(1, 1, 1);
     threeScene.add(directional);
+    threeScene.add(new THREE.AxesHelper(50));
 
-    var loader = new THREE.OBJLoader();
-    loader.load(objUrl, function (object) {
+    load3dObjWithMaterials(objUrl, resourceUrl, mtlPath).then(function (object) {
       threeModel = object;
       object.traverse(function (child) {
         if (child.isMesh) {
-          child.material = new THREE.MeshLambertMaterial({ color: 0xd8dde2, side: THREE.DoubleSide });
+          if (!child.material) {
+            child.material = new THREE.MeshLambertMaterial({ color: 0xd8dde2, side: THREE.DoubleSide });
+          } else if (Array.isArray(child.material)) {
+            child.material.forEach(function (material) {
+              material.side = THREE.DoubleSide;
+              material.needsUpdate = true;
+            });
+          } else {
+            child.material.side = THREE.DoubleSide;
+            child.material.needsUpdate = true;
+          }
           child.geometry.computeBoundingBox();
           child.geometry.computeBoundingSphere();
         }
       });
       threeScene.add(object);
+      apply3dPlacementPreview();
+      add3dGroundPlane(object);
+      attach3dTransformControls(object);
       fitCameraToObject(object);
-    }, undefined, function (error) {
+    }).catch(function (error) {
       state.threeError = "Не вдалося завантажити OBJ: " + (error && error.message ? error.message : "");
       render();
+    });
+
+    var dragStart = null;
+    threeRenderer.domElement.addEventListener("pointerdown", function (event) {
+      dragStart = { x: event.clientX, y: event.clientY, moved: false };
+    });
+    threeRenderer.domElement.addEventListener("pointermove", function (event) {
+      if (!dragStart) return;
+      if (Math.abs(event.clientX - dragStart.x) + Math.abs(event.clientY - dragStart.y) > 4) {
+        dragStart.moved = true;
+        suppressNext3dPick = true;
+      }
+    });
+    threeRenderer.domElement.addEventListener("pointerup", function () {
+      if (dragStart && dragStart.moved) {
+        suppressNext3dPick = true;
+        window.setTimeout(function () { suppressNext3dPick = false; }, 300);
+      }
+      dragStart = null;
     });
 
     threeRenderer.domElement.addEventListener("click", function (event) {
@@ -848,7 +1023,186 @@
     threeRenderer.render(threeScene, threeCamera);
   }
 
+  function update3dStatusDom() {
+    var status = root.querySelector(".smartalign-3d-status");
+    if (!status) return;
+    var placement = normalize3dPlacement(state.placement3d);
+    status.textContent = state.threeError || (
+      "3D від ортофото: X " + formatNumber(placement.offset_x, 2) +
+      " м, Y " + formatNumber(placement.offset_y, 2) +
+      " м, Z " + formatNumber(placement.offset_z, 2) +
+      " м, поворот " + formatNumber(placement.yaw_deg, 1) +
+      "°, масштаб " + formatNumber(placement.scale, 3)
+    );
+  }
+
+  function sync3dPlacementInputs() {
+    var placement = normalize3dPlacement(state.placement3d);
+    Array.prototype.forEach.call(root.querySelectorAll("[data-3d-placement]"), function (input) {
+      var key = input.getAttribute("data-3d-placement");
+      if (placement[key] == null) return;
+      input.value = String(Math.round(Number(placement[key]) * 1000) / 1000);
+    });
+    update3dStatusDom();
+  }
+
+  function apply3dPlacementPreview() {
+    if (!threeModel) return;
+    var placement = normalize3dPlacement(state.placement3d);
+    threeModel.position.set(placement.offset_x, placement.offset_y, placement.offset_z);
+    threeModel.rotation.z = placement.yaw_deg * Math.PI / 180;
+    threeModel.scale.set(placement.scale, placement.scale, placement.scale);
+    sync3dPlacementInputs();
+  }
+
+  function updatePlacementFrom3dModel() {
+    if (!threeModel) return;
+    var scale = (Number(threeModel.scale.x) + Number(threeModel.scale.y) + Number(threeModel.scale.z)) / 3;
+    if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+    threeModel.scale.set(scale, scale, scale);
+    state.placement3d = normalize3dPlacement({
+      offset_x: threeModel.position.x,
+      offset_y: threeModel.position.y,
+      offset_z: threeModel.position.z,
+      yaw_deg: threeModel.rotation.z * 180 / Math.PI,
+      scale: scale
+    });
+    sync3dPlacementInputs();
+  }
+
+  function update3dTransformControlsMode() {
+    if (!threeTransformControls) return;
+    var mode = state.transformMode3d || "translate";
+    threeTransformControls.setMode(mode);
+    threeTransformControls.showX = mode !== "rotate";
+    threeTransformControls.showY = mode !== "rotate";
+    threeTransformControls.showZ = true;
+  }
+
+  function attach3dTransformControls(object) {
+    if (!window.THREE || !THREE.TransformControls || !threeCamera || !threeRenderer || !threeScene) return;
+    threeTransformControls = new THREE.TransformControls(threeCamera, threeRenderer.domElement);
+    threeTransformControls.attach(object);
+    update3dTransformControlsMode();
+    threeTransformControls.addEventListener("dragging-changed", function (event) {
+      if (threeControls) threeControls.enabled = !event.value;
+      if (!event.value) {
+        suppressNext3dPick = true;
+        window.setTimeout(function () { suppressNext3dPick = false; }, 300);
+      }
+    });
+    threeTransformControls.addEventListener("objectChange", updatePlacementFrom3dModel);
+    threeScene.add(threeTransformControls);
+  }
+
+  function threeMapTextureCenter() {
+    var view = state.mapView || {};
+    if (Number.isFinite(Number(view.lat)) && Number.isFinite(Number(view.lng))) {
+      return { lat: Number(view.lat), lng: Number(view.lng) };
+    }
+    var bounds = state.info && state.info.orthophoto && state.info.orthophoto.bounds_wgs84;
+    if (bounds && bounds.length === 4) {
+      return {
+        lat: (Number(bounds[1]) + Number(bounds[3])) / 2,
+        lng: (Number(bounds[0]) + Number(bounds[2])) / 2
+      };
+    }
+    return { lat: 48.7, lng: 31.2 };
+  }
+
+  function lonLatToTile(lng, lat, zoom) {
+    var latRad = lat * Math.PI / 180;
+    var scale = Math.pow(2, zoom);
+    return {
+      x: Math.floor((lng + 180) / 360 * scale),
+      y: Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * scale)
+    };
+  }
+
+  function esriSatelliteTileUrl(x, y, z) {
+    return "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + z + "/" + y + "/" + x;
+  }
+
+  function loadImageForCanvas(url) {
+    return new Promise(function (resolve, reject) {
+      var image = new Image();
+      image.crossOrigin = "anonymous";
+      image.onload = function () { resolve(image); };
+      image.onerror = reject;
+      image.src = url;
+    });
+  }
+
+  function create3dMapCanvasTexture() {
+    var center = threeMapTextureCenter();
+    var zoom = 17;
+    var tile = lonLatToTile(center.lng, center.lat, zoom);
+    var tileSize = 256;
+    var radius = 1;
+    var canvas = document.createElement("canvas");
+    canvas.width = tileSize * 3;
+    canvas.height = tileSize * 3;
+    var context = canvas.getContext("2d");
+    var tasks = [];
+
+    for (var dy = -radius; dy <= radius; dy += 1) {
+      for (var dx = -radius; dx <= radius; dx += 1) {
+        (function (offsetX, offsetY) {
+          var url = esriSatelliteTileUrl(tile.x + offsetX, tile.y + offsetY, zoom);
+          tasks.push(loadImageForCanvas(url).then(function (image) {
+            context.drawImage(image, (offsetX + radius) * tileSize, (offsetY + radius) * tileSize, tileSize, tileSize);
+          }));
+        })(dx, dy);
+      }
+    }
+
+    return Promise.all(tasks).then(function () {
+      var texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    });
+  }
+
+  function add3dGroundPlane(object) {
+    if (!window.THREE || !threeScene) return;
+    var box = new THREE.Box3().setFromObject(object);
+    var size = box.getSize(new THREE.Vector3());
+    var center = box.getCenter(new THREE.Vector3());
+    var planeSize = Math.max(size.x, size.y, size.z, 1) * 1.35;
+    var geometry = new THREE.PlaneGeometry(planeSize, planeSize);
+    var fallbackMaterial = new THREE.MeshLambertMaterial({
+      color: 0x384a36,
+      opacity: 0.72,
+      side: THREE.DoubleSide,
+      transparent: true
+    });
+    threeGround = new THREE.Mesh(geometry, fallbackMaterial);
+    threeGround.position.set(center.x, center.y, box.min.z - Math.max(planeSize * 0.002, 0.05));
+    threeScene.add(threeGround);
+
+    var grid = new THREE.GridHelper(planeSize, 20, 0x75a7ff, 0x4d5965);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.copy(threeGround.position);
+    grid.position.z += 0.02;
+    threeScene.add(grid);
+
+    create3dMapCanvasTexture().then(function (texture) {
+      if (!threeGround) return;
+      texture.anisotropy = threeRenderer ? threeRenderer.capabilities.getMaxAnisotropy() : 1;
+      threeGround.material = new THREE.MeshLambertMaterial({
+        map: texture,
+        opacity: 0.76,
+        side: THREE.DoubleSide,
+        transparent: true
+      });
+    }).catch(function () {});
+  }
+
   function pick3dPoint(event, canvas) {
+    if (suppressNext3dPick) {
+      suppressNext3dPick = false;
+      return;
+    }
     if (!threeModel || !threeRaycaster || !threeCamera || !threePointer) return;
     var rect = canvas.getBoundingClientRect();
     threePointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -886,6 +1240,46 @@
 
     var calculate3d = document.getElementById("smartalign-3d-calculate");
     if (calculate3d) calculate3d.addEventListener("click", calculate3dAlignment);
+
+    Array.prototype.forEach.call(root.querySelectorAll("[data-3d-transform-mode]"), function (button) {
+      button.addEventListener("click", function () {
+        state.transformMode3d = button.getAttribute("data-3d-transform-mode") || "translate";
+        update3dTransformControlsMode();
+        Array.prototype.forEach.call(root.querySelectorAll("[data-3d-transform-mode]"), function (item) {
+          item.classList.toggle("active", item === button);
+        });
+      });
+    });
+
+    var resetPlacement = document.getElementById("smartalign-3d-reset-placement");
+    if (resetPlacement) resetPlacement.addEventListener("click", function () {
+      set3dPlacement({ offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 });
+    });
+
+    Array.prototype.forEach.call(root.querySelectorAll("[data-3d-placement]"), function (input) {
+      function updatePlacement() {
+        var key = input.getAttribute("data-3d-placement");
+        var patch = {};
+        patch[key] = Number(input.value);
+        set3dPlacement(patch);
+      }
+      input.addEventListener("input", updatePlacement);
+      input.addEventListener("change", function () {
+        updatePlacement();
+      });
+    });
+
+    Array.prototype.forEach.call(root.querySelectorAll("[data-3d-nudge]"), function (button) {
+      button.addEventListener("click", function () {
+        var parts = String(button.getAttribute("data-3d-nudge") || "").split(":");
+        var key = parts[0];
+        var delta = Number(parts[1] || 0);
+        var current = normalize3dPlacement(state.placement3d);
+        var patch = {};
+        patch[key] = Number(current[key] || 0) + delta;
+        set3dPlacement(patch);
+      });
+    });
 
     Array.prototype.forEach.call(root.querySelectorAll("[data-height-point]"), function (input) {
       function updateHeight() {
@@ -1207,6 +1601,9 @@
 
   function align3dModel() {
     state.mode = "3d";
+    if (state.info && state.info.alignment_3d && state.info.alignment_3d.placement) {
+      state.placement3d = normalize3dPlacement(state.info.alignment_3d.placement);
+    }
     if (!state.points3d.length) seed3dPointsFromOrtho();
     state.activePoint = Math.max(0, Math.min(state.activePoint, state.points3d.length - 1));
     render();
@@ -1214,12 +1611,17 @@
 
   function calculate3dAlignment() {
     var pairs = valid3dPairs();
-    if (pairs.length < 3) return;
     state.aligning3d = true;
     render();
-    postJson("align-3d/", { points: pairs })
+    var payload = pairs.length >= 3
+      ? { points: pairs }
+      : { placement: normalize3dPlacement(state.placement3d) };
+    postJson("align-3d/", payload)
       .then(function (json) {
         state.info.alignment_3d = json.alignment_3d;
+        if (json.alignment_3d && json.alignment_3d.placement) {
+          state.placement3d = normalize3dPlacement(json.alignment_3d.placement);
+        }
         if (json.alignment_3d && Array.isArray(json.alignment_3d.points)) {
           state.points3d = json.alignment_3d.points.map(function (point) {
             return {
@@ -1551,13 +1953,13 @@
     map.on("moveend", function () {
       var center = map.getCenter();
       state.mapView = { lat: center.lat, lng: center.lng, zoom: map.getZoom() };
-      loadOrthophotosForCurrentBounds();
+      if (state.mode !== "3d") loadOrthophotosForCurrentBounds();
     });
 
     syncAlignedOverlay();
     syncOrthophotoLayer();
     drawMapMarkers();
-    loadOrthophotosForCurrentBounds();
+    if (state.mode !== "3d") loadOrthophotosForCurrentBounds();
     setTimeout(function () {
       if (map) map.invalidateSize();
     }, 80);
@@ -1569,6 +1971,7 @@
       map.removeLayer(alignedOverlay);
       alignedOverlay = null;
     }
+    if (state.mode === "3d") return;
     if (!state.previewVisible || Number(state.previewOpacity || 0) <= 0) return;
 
     var alignment = state.info && state.info.alignment;
@@ -1605,6 +2008,7 @@
       map.removeLayer(orthophotoLayer);
       orthophotoLayer = null;
     }
+    if (state.mode === "3d") return;
     if (!state.activeOrthophoto || !state.activeOrthophoto.tile_url) return;
     var options = {
       opacity: 0.9,
@@ -1707,6 +2111,9 @@
             };
           });
           state.activePoint = Math.max(0, state.points.length - 1);
+        }
+        if (json.alignment_3d && json.alignment_3d.placement) {
+          state.placement3d = normalize3dPlacement(json.alignment_3d.placement);
         }
         var initial = initialMapViewFromOrthophoto();
         state.mapView = { lat: initial.lat, lng: initial.lng, zoom: initial.zoom || 16 };

@@ -70,6 +70,14 @@
   margin-left: 0;
 }
 
+.smartalign-toolbar .smartalign-3d-toolbar-controls {
+  align-items: flex-start;
+  display: flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-width: 0;
+}
+
 .smartalign-back + .smartalign-toolbar {
   margin-left: 8px;
 }
@@ -99,7 +107,8 @@
 }
 
 .smartalign-workspace-3d {
-  grid-template-columns: minmax(420px, 1.05fr) minmax(420px, 0.95fr);
+  grid-template-columns: minmax(0, 1fr);
+  margin-top: 8px;
 }
 
 .smartalign-panel {
@@ -199,6 +208,17 @@
   position: absolute;
 }
 
+.smartalign-3d-gizmo-tools {
+  display: flex;
+  gap: 6px;
+}
+
+.smartalign-3d-gizmo-tools .btn.active {
+  background: #2c3e50;
+  border-color: #2c3e50;
+  color: #fff;
+}
+
 .smartalign-3d-table-wrap {
   border-top: 1px solid #d8dee4;
   flex: 0 0 auto;
@@ -238,6 +258,60 @@
   border-radius: 4px;
   max-width: 82px;
   padding: 3px 5px;
+}
+
+.smartalign-3d-placement {
+  flex: 0 0 auto;
+  padding: 10px;
+}
+
+.smartalign-3d-toolbar-controls .smartalign-3d-placement {
+  border-top: 0;
+  flex: 1 1 auto;
+  min-width: 520px;
+  padding: 0;
+}
+
+.smartalign-3d-placement-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(5, minmax(72px, 1fr));
+}
+
+.smartalign-3d-toolbar-controls .smartalign-3d-placement-grid {
+  grid-template-columns: repeat(5, minmax(88px, 150px));
+}
+
+.smartalign-3d-placement-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+}
+
+.smartalign-3d-placement-field span {
+  color: #50657c;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.smartalign-3d-placement-field input {
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  height: 30px;
+  padding: 3px 5px;
+  width: 100%;
+}
+
+.smartalign-3d-nudge {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.smartalign-3d-toolbar-controls .smartalign-3d-nudge {
+  margin-top: 6px;
 }
 
 .smartalign-map-actions {

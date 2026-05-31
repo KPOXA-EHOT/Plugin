@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import glob
 import gzip
 import hashlib
 import struct
@@ -22,9 +23,10 @@ from pathlib import Path
 from app import models, pending_actions
 from app.api.common import check_project_perms, get_and_check_project
 from app.plugins import Menu, MountPoint, PluginBase
+from app.raster_utils import export_raster as export_raster_sync
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
-from django.contrib.gis.geos import Polygon
+from django.contrib.gis.geos import GEOSGeometry, Polygon
 from django.http import FileResponse, Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import render
 from django.utils.text import get_valid_filename
@@ -641,11 +643,14 @@ class Plugin(SmartAlignMixin, PluginBase):
         def delta_orthophoto_export(request, project_id, task_id):
             try:
                 task = self.get_export_task(request, project_id, task_id)
-                export = self.create_delta_orthophoto_export(task)
+                options = self.read_json_body(request)
+                logger.info("Smartpoint Delta orthophoto options: %s", json.dumps(options, ensure_ascii=False))
+                export = self.create_delta_orthophoto_export(task, options)
                 return JsonResponse({
                     "success": True,
                     "url": "/plugins/{}/api/delta/{}/download/".format(self.get_name(), export["id"]),
-                    "filename": export["filename"]
+                    "filename": export["filename"],
+                    "crop": bool(export.get("crop"))
                 })
             except ValueError as e:
                 logger.exception("Smartpoint Delta orthophoto export failed")
@@ -918,6 +923,28 @@ class Plugin(SmartAlignMixin, PluginBase):
                 raise ValueError("Delta auto UTM supports EPSG:32636 and EPSG:32637 only")
             return epsg
 
+    def get_delta_target_epsg(self, source_path, options=None):
+        candidates = []
+        if isinstance(options, dict):
+            candidates.append(options.get("epsg"))
+            export_options = options.get("export_options")
+            if isinstance(export_options, dict):
+                candidates.append(export_options.get("epsg"))
+
+        for value in candidates:
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            try:
+                epsg = int(raw.replace("EPSG:", "").replace("epsg:", ""))
+            except ValueError:
+                continue
+            if epsg not in DELTA_ALLOWED_AUTO_EPSG:
+                raise ValueError("Delta export supports EPSG:32636 and EPSG:32637 only")
+            return epsg
+
+        return self.detect_delta_epsg(source_path)
+
     def run_gdal(self, args):
         completed = subprocess.run(
             args,
@@ -930,15 +957,286 @@ class Plugin(SmartAlignMixin, PluginBase):
             message = (completed.stderr or completed.stdout or "").strip()
             raise ValueError(message or "GDAL command failed")
 
-    def create_delta_orthophoto_export(self, task):
+
+    def apply_mosaic_black_mask(self, output_path):
+        try:
+            import numpy as np
+            from rasterio.enums import ColorInterp
+        except Exception as e:
+            raise ValueError("Rasterio/NumPy is required for black mask: {}".format(e))
+
+        temp_path = output_path + ".masked.tif"
+
+        with rasterio.open(output_path, "r") as src:
+            profile = src.profile.copy()
+            profile.update({
+                "count": 4,
+                "nodata": None,
+                "compress": DELTA_COMPRESSION,
+                "tiled": True,
+                "blockxsize": DELTA_BLOCKSIZE,
+                "blockysize": DELTA_BLOCKSIZE,
+                "BIGTIFF": "IF_SAFER"
+            })
+
+            with rasterio.open(temp_path, "w", **profile) as dst:
+                for _, window in src.block_windows(1):
+                    rgb = src.read([1, 2, 3], window=window)
+
+                    alpha = np.where(
+                        np.any(rgb > 5, axis=0),
+                        255,
+                        0
+                    ).astype("uint8")
+
+                    dst.write(rgb[0], 1, window=window)
+                    dst.write(rgb[1], 2, window=window)
+                    dst.write(rgb[2], 3, window=window)
+                    dst.write(alpha, 4, window=window)
+
+                try:
+                    dst.colorinterp = (
+                        ColorInterp.red,
+                        ColorInterp.green,
+                        ColorInterp.blue,
+                        ColorInterp.alpha
+                    )
+                except Exception:
+                    pass
+
+        os.replace(temp_path, output_path)
+
+
+
+    def normalize_delta_crop_wkt(self, options):
+        if not isinstance(options, dict):
+            return ""
+        candidates = [
+            options.get("crop"),
+            options.get("cutline"),
+            options.get("polygon"),
+            options.get("boundary"),
+            options.get("geometry")
+        ]
+        export_options = options.get("export_options")
+        if isinstance(export_options, dict):
+            candidates += [
+                export_options.get("crop"),
+                export_options.get("cutline"),
+                export_options.get("polygon"),
+                export_options.get("boundary"),
+                export_options.get("geometry")
+            ]
+        for value in candidates:
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            upper = raw.upper()
+            if upper.startswith("POLYGON") or upper.startswith("MULTIPOLYGON"):
+                return raw
+        return ""
+
+    def write_delta_crop_geojson(self, export_dir, crop_wkt):
+        try:
+            geometry = GEOSGeometry(crop_wkt, srid=4326)
+        except Exception as e:
+            raise ValueError("Invalid Delta crop polygon: {}".format(e))
+        if geometry.empty:
+            raise ValueError("Invalid Delta crop polygon: empty geometry")
+
+        crop_path = safe_child(export_dir, "delta_crop.geojson")
+        payload = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {},
+                "geometry": json.loads(geometry.geojson)
+            }]
+        }
+        with open(crop_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        return crop_path
+
+    def get_delta_task_crop_wkt(self, task, options=None):
+        explicit_crop = self.normalize_delta_crop_wkt(options or {})
+        if explicit_crop:
+            return explicit_crop, "explicit_crop_wkt"
+
+        task_crop = getattr(task, "crop", None)
+        if task_crop is None:
+            return "", ""
+
+        return task_crop.wkt, "task_crop"
+
+    def create_delta_standard_crop_source(self, original_source_path, target_epsg, export_dir, task, crop_wkt, crop_source):
+        if not crop_wkt:
+            return "", {}
+
+        output_path = safe_child(export_dir, "webodm_cropped_source.tif")
+        export_options = {
+            "epsg": int(target_epsg),
+            "proj": None,
+            "expression": None,
+            "format": "gtiff",
+            "rescale": None,
+            "color_map": None,
+            "hillshade": None,
+            "asset_type": "orthophoto",
+            "name": task.name,
+            "crop": crop_wkt
+        }
+
+        logger.info(
+            "Smartpoint Delta creating WebODM cropped source from %s crop for task %s",
+            crop_source,
+            task.id
+        )
+        env = self.gdal_environment()
+        original_env = {key: os.environ.get(key) for key in env}
+        try:
+            os.environ.update(env)
+            export_raster_sync(original_source_path, output_path, **export_options)
+        finally:
+            for key, value in original_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+            raise ValueError("WebODM cropped orthophoto export was not created")
+
+        try:
+            with rasterio.open(output_path) as dataset:
+                if dataset.width <= 0 or dataset.height <= 0 or dataset.count < 1:
+                    raise ValueError("WebODM cropped orthophoto export is empty")
+        except Exception as e:
+            raise ValueError("WebODM cropped orthophoto export is invalid: {}".format(e))
+
+        return output_path, export_options
+
+    def get_latest_webodm_tmp_raster(self, original_source_path, target_epsg):
+        """
+        WebODM's built-in orthophoto export creates cropped GeoTIFF files in MEDIA_TMP
+        as tmpXXXX_raster.tif. If the user has just used the standard export dialog
+        with crop, this method reuses that already-cropped raster as Delta input.
+
+        Safety:
+        - only GeoTIFF raster exports are considered;
+        - newest files first;
+        - file must be readable by rasterio;
+        - file CRS must match the selected/target EPSG when possible;
+        - file must overlap the original orthophoto bounds;
+        - if no safe candidate is found, Delta falls back to the full original orthophoto.
+        """
+        tmp_root = getattr(settings, "MEDIA_TMP", None)
+        if not tmp_root or not os.path.isdir(tmp_root):
+            return ""
+
+        try:
+            with rasterio.open(original_source_path) as original:
+                original_crs = original.crs
+                original_bounds = original.bounds
+        except Exception:
+            original_crs = None
+            original_bounds = None
+
+        candidates = []
+        for pattern in ("*_raster.tif", "*_raster.tiff"):
+            candidates.extend(glob.glob(os.path.join(tmp_root, pattern)))
+
+        candidates = [
+            path for path in candidates
+            if os.path.isfile(path) and os.path.getsize(path) > 0
+        ]
+        candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+
+        for path in candidates[:20]:
+            try:
+                with rasterio.open(path) as candidate:
+                    if candidate.width <= 0 or candidate.height <= 0:
+                        continue
+                    if candidate.count < 1:
+                        continue
+
+                    candidate_epsg = candidate.crs.to_epsg() if candidate.crs else None
+                    if candidate_epsg and int(candidate_epsg) != int(target_epsg):
+                        continue
+
+                    if original_crs and candidate.crs and original_crs == candidate.crs and original_bounds:
+                        cb = candidate.bounds
+                        if cb.right < original_bounds.left or cb.left > original_bounds.right:
+                            continue
+                        if cb.top < original_bounds.bottom or cb.bottom > original_bounds.top:
+                            continue
+
+                return path
+            except Exception:
+                continue
+
+        return ""
+
+
+    def copy_and_consume_delta_tmp_raster(self, tmp_raster_path, export_dir):
+        """
+        Copy WebODM temporary raster into the Delta export folder and delete the
+        original tmp file. This prevents old cropped exports from being reused
+        after the user clears crop and runs Delta again.
+        """
+        if not tmp_raster_path or not os.path.isfile(tmp_raster_path):
+            return ""
+
+        ext = os.path.splitext(tmp_raster_path)[1].lower()
+        if ext not in (".tif", ".tiff"):
+            return ""
+
+        copied_path = safe_child(export_dir, "webodm_tmp_source{}".format(ext))
+        shutil.copy2(tmp_raster_path, copied_path)
+
+        try:
+            os.remove(tmp_raster_path)
+        except OSError:
+            pass
+
+        if not os.path.isfile(copied_path) or os.path.getsize(copied_path) <= 0:
+            return ""
+
+        return copied_path
+
+
+    def create_delta_orthophoto_export(self, task, options=None):
         self.cleanup_delta_exports()
-        source_path = self.get_delta_orthophoto_source(task)
-        target_epsg = self.detect_delta_epsg(source_path)
-        nodata = self.detect_delta_nodata(source_path)
+        original_source_path = self.get_delta_orthophoto_source(task)
+        target_epsg = self.get_delta_target_epsg(original_source_path, options or {})
 
         export_id = str(uuid.uuid4())
         export_dir = self.delta_export_dir(export_id)
         os.makedirs(export_dir, exist_ok=True)
+
+        crop_wkt, crop_source = self.get_delta_task_crop_wkt(task, options or {})
+        tmp_raster_path = ""
+        source_mode = "original_orthophoto"
+        copied_tmp_raster_path = ""
+        raster_export_options = {}
+
+        # If WebODM has a crop polygon, use the same raster export path as the
+        # built-in download first, then convert that cropped GeoTIFF to Delta COG.
+        # Without crop, use the original orthophoto so stale MEDIA_TMP files can
+        # never affect a full Delta export.
+        if crop_wkt:
+            source_path, raster_export_options = self.create_delta_standard_crop_source(
+                original_source_path,
+                target_epsg,
+                export_dir,
+                task,
+                crop_wkt,
+                crop_source
+            )
+            source_mode = "webodm_standard_crop_export"
+        else:
+            source_path = original_source_path
+
+        nodata = self.detect_delta_nodata(source_path)
 
         filename = get_valid_filename("{}_orthophoto_delta.tif".format(task.name or "task"))
         output_path = safe_child(export_dir, filename)
@@ -947,15 +1245,17 @@ class Plugin(SmartAlignMixin, PluginBase):
         gdalwarp = self.find_gdal_tool("gdalwarp")
         gdal_translate = self.find_gdal_tool("gdal_translate")
 
-        self.run_gdal([
+        warp_args = [
             gdalwarp,
             "-of", "VRT",
             "-t_srs", "EPSG:{}".format(target_epsg),
             "-r", DELTA_RESAMPLING.lower(),
-            "-multi",
-            source_path,
-            warp_path
-        ])
+            "-srcnodata", "0 0 0",
+            "-dstalpha",
+            "-multi"
+        ]
+        warp_args += [source_path, warp_path]
+        self.run_gdal(warp_args)
 
         translate_args = [
             gdal_translate,
@@ -973,7 +1273,7 @@ class Plugin(SmartAlignMixin, PluginBase):
             translate_args += ["-a_nodata", str(nodata)]
         translate_args += [warp_path, output_path]
         self.run_gdal(translate_args)
-        self.apply_mosaic_black_mask(output_path)
+        # self.apply_mosaic_black_mask(output_path)
 
         export = {
             "id": export_id,
@@ -984,7 +1284,16 @@ class Plugin(SmartAlignMixin, PluginBase):
             "epsg": target_epsg,
             "compression": DELTA_COMPRESSION,
             "blocksize": DELTA_BLOCKSIZE,
-            "nodata": nodata
+            "nodata": nodata,
+            "crop": bool(crop_wkt),
+            "crop_wkt": crop_wkt,
+            "crop_source": crop_source,
+            "source_mode": source_mode,
+            "source_path": source_path,
+            "tmp_raster_path": tmp_raster_path,
+            "copied_tmp_raster_path": copied_tmp_raster_path,
+            "raster_export_options": raster_export_options,
+            "received_options": options or {}
         }
         with open(self.delta_export_json_path(export_id), "w", encoding="utf-8") as f:
             json.dump(export, f, ensure_ascii=False, indent=2)
@@ -2816,4 +3125,3 @@ class Plugin(SmartAlignMixin, PluginBase):
         task.update_size()
         task.save()
         return task
-

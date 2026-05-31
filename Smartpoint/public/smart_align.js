@@ -4,7 +4,7 @@
 
   var React = window.React;
   var PluginsAPI = window.PluginsAPI;
-  var SHOW_SMARTALIGN_TASK_BUTTON = false;
+  var SHOW_SMARTALIGN_TASK_BUTTON = true;
 
   function hasOrthophoto(task) {
     return task && Array.isArray(task.available_assets) && task.available_assets.indexOf("orthophoto.tif") !== -1;

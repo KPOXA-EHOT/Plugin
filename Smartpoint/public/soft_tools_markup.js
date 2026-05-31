@@ -323,8 +323,9 @@
   }
 
   function resetPointSearch() {
+    var search = pointSearchState();
     pointSearchRunToken += 1;
-    var method = normalizePointSearchMethod(pointSearchState().method);
+    var method = normalizePointSearchMethod(search.method);
     setState({
       pointSearch: {
         mode: false,
@@ -335,8 +336,8 @@
         progress: { done: 0, total: 0 },
         sourceImageId: null,
         method: method,
-        results: {},
-        candidates: {}
+        results: search.results || {},
+        candidates: search.candidates || {}
       },
       message: "",
       error: ""
@@ -385,6 +386,37 @@
     return first;
   }
 
+  function firstSuggestedPointNumberForImage(imageId) {
+    var search = pointSearchState();
+    var candidates = search.candidates && search.candidates[imageId];
+    if (!Array.isArray(candidates) || !candidates.length) return Number.POSITIVE_INFINITY;
+
+    return candidates.reduce(function (first, candidate) {
+      var number = Number(candidate.point_number);
+      if (!Number.isFinite(number) && candidate.point_id) {
+        var pointIndex = state.points.findIndex(function (point) {
+          return String(point.id) === String(candidate.point_id);
+        });
+        if (pointIndex >= 0) number = pointIndex + 1;
+      }
+      return Number.isFinite(number) ? Math.min(first, number) : first;
+    }, Number.POSITIVE_INFINITY);
+  }
+
+  function galleryPointPriorityForImage(imageId) {
+    var actualPoint = firstPointNumberForImage(imageId);
+    if (Number.isFinite(actualPoint)) {
+      return { group: 0, number: actualPoint };
+    }
+
+    var suggestedPoint = firstSuggestedPointNumberForImage(imageId);
+    if (Number.isFinite(suggestedPoint)) {
+      return { group: 1, number: suggestedPoint };
+    }
+
+    return { group: 2, number: Number.POSITIVE_INFINITY };
+  }
+
   function compareGalleryImages(a, b, sortMode, direction) {
     var multiplier = direction === "desc" ? -1 : 1;
     if (sortMode === "name") {
@@ -410,13 +442,10 @@
 
     return state.images.slice().sort(function (a, b) {
       if (state.galleryPointsFirst) {
-        var aPoint = firstPointNumberForImage(a.id);
-        var bPoint = firstPointNumberForImage(b.id);
-        var aHasPoint = Number.isFinite(aPoint);
-        var bHasPoint = Number.isFinite(bPoint);
-        if (aHasPoint && !bHasPoint) return -1;
-        if (!aHasPoint && bHasPoint) return 1;
-        if (aHasPoint && bHasPoint && aPoint !== bPoint) return aPoint - bPoint;
+        var aPriority = galleryPointPriorityForImage(a.id);
+        var bPriority = galleryPointPriorityForImage(b.id);
+        if (aPriority.group !== bPriority.group) return aPriority.group - bPriority.group;
+        if (aPriority.number !== bPriority.number) return aPriority.number - bPriority.number;
       }
       return compareGalleryImages(a, b, sortMode, direction);
     });
@@ -1542,11 +1571,11 @@
       pointSearch: Object.assign({}, search, {
         queue: queue,
         currentJob: job,
-        mode: false,
-        choosingMethod: false,
+        mode: !!search.mode,
+        choosingMethod: !!search.choosingMethod,
         running: true,
         sourceImageId: job.sourceImageId,
-        method: job.method,
+        method: (search.mode || search.choosingMethod) ? search.method : job.method,
         progress: { done: 0, total: job.total }
       }),
       message: "Шукаю точки " + pointSearchMethodLabel(job.method) + ": 0/" + job.candidateLimit + " кандидатів, перевірено 0/" + job.total + " фото" + (queue.length ? ". У черзі: " + queue.length + "." : "."),
@@ -1595,12 +1624,12 @@
       var reachedLimit = foundCount >= Number(job.candidateLimit || POINT_SEARCH_CANDIDATE_LIMIT);
       setState({
         pointSearch: Object.assign({}, currentSearch, {
-          mode: false,
-          choosingMethod: false,
+          mode: !!currentSearch.mode,
+          choosingMethod: !!currentSearch.choosingMethod,
           running: !reachedLimit,
           currentJob: reachedLimit ? null : currentSearch.currentJob,
           sourceImageId: job.sourceImageId,
-          method: normalizePointSearchMethod(json.method || job.method),
+          method: (currentSearch.mode || currentSearch.choosingMethod) ? currentSearch.method : normalizePointSearchMethod(json.method || job.method),
           results: mergedResults,
           candidates: mergedCandidates,
           progress: { done: nextOffset, total: job.total }
@@ -1766,12 +1795,6 @@
     var primaryButton = prepareMode
       ? taskButton + '<span class="soft-tools-enter-markup-wrap" title="' + (markupBlocked ? escapeHtml(enterMarkupHint) : "") + '"><button id="soft-tools-enter-markup" type="button" class="btn btn-primary btn-sm" ' + (state.busy || markupBlocked ? "disabled" : "") + '>Перейти до прив\'язки</button></span>'
       : '<button id="soft-tools-go-task" type="button" class="btn btn-primary btn-sm" ' + (state.busy ? "disabled" : "") + '><i class="fa fa-arrow-left"></i> До задачі</button>';
-    var pointSearchControls = (!prepareMode && (search.running || (search.queue || []).length)) ? (
-      '<div class="soft-tools-gallery-selection-tools">' +
-        '<button id="soft-tools-stop-current-search" type="button" class="btn btn-default btn-sm" ' + (!search.running ? "disabled" : "") + '>Зупинити поточний</button>' +
-        '<button id="soft-tools-cancel-all-search" type="button" class="btn btn-default btn-sm">Скасувати весь пошук</button>' +
-      '</div>'
-    ) : "";
     var prepareTools = prepareMode ? (
       '<div class="soft-tools-gallery-selection-tools">' +
         '<span class="soft-tools-gallery-selection-count">' + escapeHtml(selectionLabel) + '</span>' +
@@ -1796,11 +1819,18 @@
     var searchButtonLabel = search.running
       ? (search.choosingMethod ? "Скасувати вибір" : "Додати в чергу")
       : ((search.mode || search.choosingMethod) ? "Скинути пошук" : "Пошук точок");
+    var stopSearchButton = search.running
+      ? '<button id="soft-tools-stop-current-search" type="button" class="btn btn-default btn-sm">Зупинити пошук</button>'
+      : '';
+    var resetSearchButton = (!search.running && (search.mode || search.choosingMethod))
+      ? '<button id="soft-tools-point-search-cancel" type="button" class="btn btn-default btn-sm">Скинути пошук</button>'
+      : '';
     var searchTools = !prepareMode ? (
       '<div class="soft-tools-gallery-selection-tools">' +
         '<button id="soft-tools-point-search" type="button" class="btn btn-default btn-sm" ' + (!state.images.length ? "disabled" : "") + '><i class="fa fa-search"></i> ' + searchButtonLabel + '</button>' +
         searchProgress +
-        ((search.running || (search.queue || []).length || Object.keys(search.results || {}).length || search.mode || search.choosingMethod) ? '<button id="soft-tools-point-search-cancel" type="button" class="btn btn-default btn-sm">Скасувати пошук</button>' : '') +
+        stopSearchButton +
+        resetSearchButton +
         (search.choosingMethod ? '<div class="soft-tools-point-search-menu">' +
           '<button type="button" class="btn btn-default btn-sm" data-point-search-method="sift" title="Краще тримає поворот, масштаб і складну перспективу">Точний (SIFT)</button>' +
           '<button type="button" class="btn btn-default btn-sm" data-point-search-method="akaze" title="Швидкий пошук для сусідніх фото і великих наборів">Швидкий (AKAZE)</button>' +
@@ -2623,6 +2653,9 @@
     var pointSearchButton = document.getElementById("soft-tools-point-search");
     if (pointSearchButton) pointSearchButton.addEventListener("click", startPointSearchMode);
 
+    var stopCurrentSearchButton = document.getElementById("soft-tools-stop-current-search");
+    if (stopCurrentSearchButton) stopCurrentSearchButton.addEventListener("click", stopCurrentPointSearch);
+
     var pointSearchCancelButton = document.getElementById("soft-tools-point-search-cancel");
     if (pointSearchCancelButton) pointSearchCancelButton.addEventListener("click", resetPointSearch);
 
@@ -2903,4 +2936,3 @@
       root.innerHTML = '<div class="alert alert-danger">' + escapeHtml(error.message || String(error)) + '</div>';
     });
 })();
-
