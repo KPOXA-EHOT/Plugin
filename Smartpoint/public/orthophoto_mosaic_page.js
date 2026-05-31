@@ -108,31 +108,55 @@
     };
   }
 
+  function updateStatus(text) {
+    state.status = text;
+    renderListOnly();
+  }
+
+  function forceMapResize() {
+    [50, 200, 600, 1200].forEach(function (delay) {
+      window.setTimeout(function () { if (map) map.invalidateSize(true); }, delay);
+    });
+  }
+
   function setBaseMap(name) {
     if (!window.L || !map) return;
     baseMaps = createBaseMapLayers();
-    var nextLayer = baseMaps[name] || baseMaps["Esri Satellite"] || baseMaps.OpenStreetMap;
+    var nextLayer = baseMaps[name] || baseMaps.OpenStreetMap || baseMaps["Esri Satellite"];
     if (!nextLayer) return;
-    if (baseLayer) map.removeLayer(baseLayer);
+    if (baseLayer) {
+      try { map.removeLayer(baseLayer); } catch (_) {}
+    }
     baseLayer = nextLayer;
     activeBaseMap = name;
+    baseLayer.on("tileerror", function () {
+      updateStatus("Не вдалося завантажити базову карту: " + activeBaseMap + ". Спробуйте OpenStreetMap.");
+    });
     baseLayer.addTo(map);
     forceMapResize();
   }
 
-  function forceMapResize() {
-    [80, 300, 1000].forEach(function (delay) {
-      window.setTimeout(function () { if (map) map.invalidateSize(true); }, delay);
-    });
+  function clearOverlayLayers() {
+    layers.forEach(function (layer) { try { map.removeLayer(layer); } catch (_) {} });
+    layers = [];
   }
 
   function initMap() {
     var el = document.getElementById("smartpoint-mosaic-map");
     if (!el || !window.L) return;
+
+    if (map && (!map.getContainer || map.getContainer() !== el)) {
+      try { map.remove(); } catch (_) {}
+      map = null;
+      baseLayer = null;
+      layers = [];
+    }
+
     if (map) {
       forceMapResize();
       return;
     }
+
     map = window.L.map(el, { center: [48.7, 31.2], zoom: 6, zoomControl: true, attributionControl: true });
     setBaseMap(activeBaseMap);
     map.on("moveend", function () { renderListOnly(); });
@@ -147,11 +171,6 @@
     if (!values.every(Number.isFinite)) return "";
     if (values[0] >= values[2] || values[1] >= values[3]) return "";
     return values.join(",");
-  }
-
-  function updateStatus(text) {
-    state.status = text;
-    renderListOnly();
   }
 
   function applyItems(items, autoSelect) {
@@ -270,8 +289,7 @@
 
   function refreshMapLayers(doFit) {
     if (!map || !window.L) return;
-    layers.forEach(function (layer) { try { map.removeLayer(layer); } catch (_) {} });
-    layers = [];
+    clearOverlayLayers();
     var visible = selectedOrderedItems();
     visible.forEach(function (item, index) {
       var z = 100 + (visible.length - index);
