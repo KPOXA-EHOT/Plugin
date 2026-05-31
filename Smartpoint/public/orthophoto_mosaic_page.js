@@ -19,7 +19,9 @@
     order: [],
     opacity: {},
     loading: false,
-    status: "Завантаження всіх ортофото..."
+    status: "Завантаження всіх ортофото...",
+    creating: false,
+    created: false
   };
 
   function getCookie(name) {
@@ -249,6 +251,7 @@
   }
 
   function move(id, direction) {
+    if (state.creating || state.created) return;
     var idx = state.order.indexOf(id);
     if (idx < 0) return;
     var next = idx + direction;
@@ -260,11 +263,22 @@
     refreshMapLayers(false);
   }
 
+  function fitToItem(item) {
+    if (!map || !window.L || !item || !item.bounds || item.bounds.length !== 4) return;
+    try {
+      var bounds = window.L.latLngBounds([[item.bounds[1], item.bounds[0]], [item.bounds[3], item.bounds[2]]]);
+      map.fitBounds(bounds, { padding: [30, 30], maxZoom: 20 });
+      forceMapResize();
+    } catch (_) {}
+  }
+
   function toggle(id) {
+    if (state.creating || state.created) return;
     state.selected[id] = !state.selected[id];
-    firstFitDone = false;
+    var item = state.items.filter(function (x) { return x.id === id; })[0];
     render();
-    refreshMapLayers(true);
+    refreshMapLayers(false);
+    if (item) fitToItem(item);
   }
 
   function fitToBoundsList(items) {
@@ -318,24 +332,28 @@
   }
 
   function createMosaic() {
+    if (state.creating || state.created) return;
     var selected = selectedOrderedItems();
     if (selected.length < 2) return updateStatus("Оберіть мінімум 2 ортофото.");
     var payload = { layers: selected.map(function (item, index) {
       return { task_id: item.id, project_id: item.project_id, opacity: Number(state.opacity[item.id] || 75), order: index };
     }) };
-    console.log("Smartpoint mosaic create payload", payload);
-    updateStatus("Створення об’єднаного ортофото... Шарів: " + payload.layers.length);
+    state.creating = true;
+    state.status = "Створення об’єднаного ортофото... Шарів: " + payload.layers.length;
+    render();
     requestJson("/plugins/Smartpoint/api/mosaic/create/", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload)
     }).then(function (json) {
-      console.log("Smartpoint mosaic create response", json);
+      state.creating = false;
+      state.created = true;
       state.status = json.message || "Об’єднане ортофото створено.";
       if (json.task_name) state.status += "\nНова задача: " + json.task_name;
+      state.status += "\nКнопку створення заблоковано. Поверніться назад або оновіть сторінку для нового об’єднання.";
       render();
     }).catch(function (error) {
-      console.error("Smartpoint mosaic create failed", error);
+      state.creating = false;
       state.status = "Помилка створення мозаїки: " + (error.message || String(error));
       render();
     });
@@ -365,8 +383,8 @@
     root.innerHTML = '' +
       '<div class="smartpoint-mosaic-page">' +
         '<div class="smartpoint-mosaic-topbar">' +
-          '<div><h3>Об’єднання ортофото</h3><div class="soft-tools-muted">Вибір 2+ ортофото, порядок шарів, прозорість, preview на карті</div></div>' +
-          '<div class="smartpoint-mosaic-top-actions">' + renderMapPicker() + '<button type="button" class="btn btn-default" id="smartpoint-mosaic-back">Назад</button></div>' +
+          '<div class="smartpoint-mosaic-title-row"><button type="button" class="btn btn-default" id="smartpoint-mosaic-back"' + (state.creating ? ' disabled' : '') + '>Назад</button><h3>Об’єднання ортофото</h3></div>' +
+          '<div class="smartpoint-mosaic-top-actions">' + renderMapPicker() + '</div>' +
         '</div>' +
         '<div class="smartpoint-mosaic-workspace">' +
           '<div class="smartpoint-mosaic-map" id="smartpoint-mosaic-map"></div>' +
@@ -378,16 +396,16 @@
             '</div>' +
             '<div class="smartpoint-mosaic-list">' + renderItems() + '</div>' +
             '<div class="smartpoint-mosaic-footer">' +
-              '<button type="button" class="btn btn-primary btn-block" id="smartpoint-mosaic-create">Створити об’єднане ортофото</button>' +
+              '<button type="button" class="btn btn-primary btn-block" id="smartpoint-mosaic-create"' + ((state.creating || state.created || selectedOrderedItems().length < 2) ? ' disabled' : '') + '>' + (state.creating ? 'Створення...' : 'Створити об’єднане ортофото') + '</button>' +
               '<div class="smartpoint-mosaic-status" id="smartpoint-mosaic-status">' + escapeHtml(state.status) + '</div>' +
             '</div>' +
           '</aside>' +
         '</div>' +
       '</div>';
 
-    document.getElementById("smartpoint-mosaic-back").onclick = function () { window.history.back(); };
-    document.getElementById("smartpoint-mosaic-all").onclick = loadAllOrthophotos;
-    document.getElementById("smartpoint-mosaic-refresh").onclick = loadAreaOrthophotos;
+    document.getElementById("smartpoint-mosaic-back").onclick = function () { if (!state.creating) window.history.back(); };
+    document.getElementById("smartpoint-mosaic-all").onclick = function () { if (!state.creating) loadAllOrthophotos(); };
+    document.getElementById("smartpoint-mosaic-refresh").onclick = function () { if (!state.creating) loadAreaOrthophotos(); };
     document.getElementById("smartpoint-mosaic-create").onclick = createMosaic;
 
     var picker = root.querySelector(".smartpoint-mosaic-map-layer-picker");
@@ -421,15 +439,15 @@
       var opacity = Number(state.opacity[item.id] || 75);
       return '' +
         '<div class="smartpoint-mosaic-item' + (active ? ' active' : '') + '">' +
-          '<label><input type="checkbox" data-toggle-layer="' + escapeHtml(item.id) + '" ' + (active ? 'checked' : '') + '> ' +
+          '<label><input type="checkbox" data-toggle-layer="' + escapeHtml(item.id) + '" ' + (active ? 'checked' : '') + ((state.creating || state.created) ? ' disabled' : '') + '> ' +
             '<span class="smartpoint-mosaic-item-title">' + escapeHtml(item.task_name || item.id) + '</span></label>' +
           '<div class="smartpoint-mosaic-item-meta">' + escapeHtml(item.project_name || '') + '</div>' +
           '<div class="smartpoint-mosaic-item-meta">' + (active ? layerPositionLabel(selectedOrderedItems().indexOf(item), selectedOrderedItems().length) : 'Вимкнений шар') + '</div>' +
           '<div class="smartpoint-mosaic-opacity"><label data-opacity-label="' + escapeHtml(item.id) + '">Прозорість: ' + opacity + '%</label>' +
-          '<input type="range" min="0" max="100" step="5" value="' + opacity + '" data-opacity-layer="' + escapeHtml(item.id) + '"></div>' +
+          '<input type="range" min="0" max="100" step="5" value="' + opacity + '" data-opacity-layer="' + escapeHtml(item.id) + '"' + ((state.creating || state.created) ? ' disabled' : '') + '></div>' +
           '<div class="smartpoint-mosaic-item-actions">' +
-            '<button type="button" class="btn btn-default btn-xs" data-move-up="' + escapeHtml(item.id) + '">↑ вище</button>' +
-            '<button type="button" class="btn btn-default btn-xs" data-move-down="' + escapeHtml(item.id) + '">↓ нижче</button>' +
+            '<button type="button" class="btn btn-default btn-xs" data-move-up="' + escapeHtml(item.id) + '"' + ((state.creating || state.created) ? ' disabled' : '') + '>↑ вище</button>' +
+            '<button type="button" class="btn btn-default btn-xs" data-move-down="' + escapeHtml(item.id) + '"' + ((state.creating || state.created) ? ' disabled' : '') + '>↓ нижче</button>' +
           '</div>' +
         '</div>';
     }).join("");
