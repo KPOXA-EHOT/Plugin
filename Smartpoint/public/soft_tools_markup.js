@@ -280,6 +280,13 @@
     return state.images.find(function (image) { return image.id === state.activeImageId; }) || state.images[0] || null;
   }
 
+  function initialPreparedImageScale(image) {
+    var fullSide = Math.max(Number(image && image.width || 1), Number(image && image.height || 1));
+    var previewSide = Math.max(Number(image && image.preview_width || fullSide), Number(image && image.preview_height || fullSide));
+    if (!Number.isFinite(fullSide) || fullSide <= 0 || !Number.isFinite(previewSide) || previewSide <= 0) return 1;
+    return clamp(previewSide / fullSide, 0.08, 1);
+  }
+
   function activePoint() {
     return state.points.find(function (point) { return point.id === state.activePointId; }) || null;
   }
@@ -629,11 +636,13 @@
   }
 
   function openImage(imageId) {
+    var nextMode = state.phase === "prepare" ? "compare" : "detail";
+    var image = state.images.find(function (candidate) { return candidate.id === imageId; }) || null;
     setState({
-      viewMode: state.phase === "prepare" ? "compare" : "detail",
+      viewMode: nextMode,
       activeImageId: imageId,
       galleryScrollTop: captureGalleryScrollTop(),
-      imageView: { scale: 1, panX: 0, panY: 0 },
+      imageView: { scale: nextMode === "detail" ? initialPreparedImageScale(image) : 1, panX: 0, panY: 0 },
       compareMode: "split",
       compareSplit: 50,
       compareView: { scale: 1, panX: 0, panY: 0 },
@@ -779,13 +788,13 @@
     var relativeY = clientY - rect.top;
     if (relativeX < 0 || relativeY < 0 || relativeX > rect.width || relativeY > rect.height) return null;
 
-    var previewX = (relativeX / rect.width) * Number(image.preview_width || element.naturalWidth || image.width || 1);
-    var previewY = (relativeY / rect.height) * Number(image.preview_height || element.naturalHeight || image.height || 1);
+    var fullX = (relativeX / rect.width) * Number(image.width || element.naturalWidth || 1);
+    var fullY = (relativeY / rect.height) * Number(image.height || element.naturalHeight || 1);
 
     return {
       image: image,
-      px: Math.round(previewX * Number(image.scale_x || 1) * 1000) / 1000,
-      py: Math.round(previewY * Number(image.scale_y || 1) * 1000) / 1000
+      px: Math.round(fullX * 1000) / 1000,
+      py: Math.round(fullY * 1000) / 1000
     };
   }
 
@@ -912,7 +921,7 @@
   function setImageZoom(nextScale, anchor) {
     var imageView = state.imageView || { scale: 1, panX: 0, panY: 0 };
     var stage = document.getElementById("soft-tools-image-stage");
-    var scale = clamp(nextScale, 0.5, 6);
+    var scale = clamp(nextScale, Math.min(0.5, initialPreparedImageScale(activeImage())), 6);
     var nextView = Object.assign({}, imageView, { scale: scale, panX: 0, panY: 0 });
 
     if (stage && anchor) {
@@ -933,7 +942,7 @@
 
   function resetImageView() {
     var stage = document.getElementById("soft-tools-image-stage");
-    applyImageView({ scale: 1, panX: 0, panY: 0 });
+    applyImageView({ scale: initialPreparedImageScale(activeImage()), panX: 0, panY: 0 });
     if (stage) {
       stage.scrollLeft = 0;
       stage.scrollTop = 0;
@@ -2002,27 +2011,27 @@
     var image = activeImage();
     if (!image) return '<div class="soft-tools-empty">Немає підготовлених зображень.</div>';
     var imageView = state.imageView || { scale: 1, panX: 0, panY: 0 };
-    var previewWidth = Number(image.preview_width || image.width || 1);
-    var previewHeight = Number(image.preview_height || image.height || 1);
-    var imageWidth = previewWidth * imageView.scale;
-    var imageHeight = previewHeight * imageView.scale;
+    var fullWidth = Number(image.width || image.preview_width || 1);
+    var fullHeight = Number(image.height || image.preview_height || 1);
+    var imageWidth = fullWidth * imageView.scale;
+    var imageHeight = fullHeight * imageView.scale;
     var search = pointSearchState();
     var searchCandidates = (search.candidates && search.candidates[image.id]) || [];
     var dots = observationsForImage(image.id).map(function (entry) {
-      var previewX = entry.observation.px / Number(image.scale_x || 1);
-      var previewY = entry.observation.py / Number(image.scale_y || 1);
-      var left = previewX * imageView.scale;
-      var top = previewY * imageView.scale;
+      var imageX = Number(entry.observation.px || 0);
+      var imageY = Number(entry.observation.py || 0);
+      var left = imageX * imageView.scale;
+      var top = imageY * imageView.scale;
       var active = entry.point.id === state.activePointId ? " active" : "";
       var number = state.points.findIndex(function (point) { return point.id === entry.point.id; }) + 1;
-      return '<span class="soft-tools-observation-dot' + active + pointQualityClass(entry.point) + '" data-point-id="' + escapeHtml(entry.point.id) + '" data-preview-x="' + previewX + '" data-preview-y="' + previewY + '" style="left:' + left + 'px;top:' + (top - 24) + 'px"><span class="soft-tools-pin-label">' + number + '</span></span>' +
-        (active ? '<button type="button" class="soft-tools-observation-delete" data-point-id="' + escapeHtml(entry.point.id) + '" data-image-id="' + escapeHtml(image.id) + '" data-preview-x="' + previewX + '" data-preview-y="' + previewY + '" style="left:' + left + 'px;top:' + top + 'px">Видалити</button>' : '');
+      return '<span class="soft-tools-observation-dot' + active + pointQualityClass(entry.point) + '" data-point-id="' + escapeHtml(entry.point.id) + '" data-preview-x="' + imageX + '" data-preview-y="' + imageY + '" style="left:' + left + 'px;top:' + (top - 24) + 'px"><span class="soft-tools-pin-label">' + number + '</span></span>' +
+        (active ? '<button type="button" class="soft-tools-observation-delete" data-point-id="' + escapeHtml(entry.point.id) + '" data-image-id="' + escapeHtml(image.id) + '" data-preview-x="' + imageX + '" data-preview-y="' + imageY + '" style="left:' + left + 'px;top:' + top + 'px">Видалити</button>' : '');
     }).join("") + searchCandidates.map(function (candidate) {
-      var previewX = Number(candidate.px) / Number(image.scale_x || 1);
-      var previewY = Number(candidate.py) / Number(image.scale_y || 1);
-      var left = previewX * imageView.scale;
-      var top = previewY * imageView.scale;
-      return '<button type="button" class="soft-tools-suggested-dot" data-point-id="' + escapeHtml(candidate.point_id) + '" data-image-id="' + escapeHtml(image.id) + '" data-px="' + escapeHtml(candidate.px) + '" data-py="' + escapeHtml(candidate.py) + '" data-preview-x="' + previewX + '" data-preview-y="' + previewY + '" title="Підтвердити знайдену точку" style="left:' + left + 'px;top:' + (top - 24) + 'px"><span class="soft-tools-pin-label">' + escapeHtml(candidate.point_number) + '</span></button>';
+      var imageX = Number(candidate.px || 0);
+      var imageY = Number(candidate.py || 0);
+      var left = imageX * imageView.scale;
+      var top = imageY * imageView.scale;
+      return '<button type="button" class="soft-tools-suggested-dot" data-point-id="' + escapeHtml(candidate.point_id) + '" data-image-id="' + escapeHtml(image.id) + '" data-px="' + escapeHtml(candidate.px) + '" data-py="' + escapeHtml(candidate.py) + '" data-preview-x="' + imageX + '" data-preview-y="' + imageY + '" title="Підтвердити знайдену точку" style="left:' + left + 'px;top:' + (top - 24) + 'px"><span class="soft-tools-pin-label">' + escapeHtml(candidate.point_number) + '</span></button>';
     }).join("");
 
     return '' +
@@ -2033,7 +2042,7 @@
       '</div>' +
       '<div id="soft-tools-image-stage" class="soft-tools-image-stage">' +
         '<div class="soft-tools-image-wrap" style="width:' + imageWidth + 'px;height:' + imageHeight + 'px">' +
-          '<img id="soft-tools-active-image" src="' + imageUrl("preview", image) + '" alt="" draggable="false">' +
+          '<img id="soft-tools-active-image" src="' + imageUrl("prepared", image) + '" alt="" draggable="false">' +
           dots +
         '</div>' +
       '</div>';
@@ -2390,8 +2399,8 @@
     var image = activeImage();
     state.imageView = view;
     if (wrap && image) {
-      wrap.style.width = (Number(image.preview_width || image.width || 1) * view.scale) + "px";
-      wrap.style.height = (Number(image.preview_height || image.height || 1) * view.scale) + "px";
+      wrap.style.width = (Number(image.width || image.preview_width || 1) * view.scale) + "px";
+      wrap.style.height = (Number(image.height || image.preview_height || 1) * view.scale) + "px";
     }
     updateObservationDotPositions();
   }
@@ -2506,8 +2515,8 @@
           moved = true;
           lastCoordinates = imageCoordinatesFromClient(moveEvent.clientX, moveEvent.clientY);
           if (!lastCoordinates || !image) return;
-          dot.setAttribute("data-preview-x", String(lastCoordinates.px / Number(image.scale_x || 1)));
-          dot.setAttribute("data-preview-y", String(lastCoordinates.py / Number(image.scale_y || 1)));
+          dot.setAttribute("data-preview-x", String(lastCoordinates.px));
+          dot.setAttribute("data-preview-y", String(lastCoordinates.py));
           updateObservationDotPositions();
         }
 

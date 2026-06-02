@@ -12,7 +12,6 @@ import html
 import math
 import struct
 import tempfile
-import threading
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +27,6 @@ from app.plugins import Menu, MountPoint, PluginBase
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.contrib.gis.geos import Polygon
-from django.db import close_old_connections
 from django.http import FileResponse, Http404, HttpResponseBadRequest, JsonResponse
 from django.shortcuts import render
 from django.utils.text import get_valid_filename
@@ -55,7 +53,6 @@ DELTA_3D_SCENE_LAYER_NAME = "3dSceneLayer.json.gz"
 ELEVATION_PROVIDER = "OpenTopoData SRTM90m"
 ELEVATION_API_URL = "https://api.opentopodata.org/v1/srtm90m"
 ELEVATION_TIMEOUT_SECONDS = 12
-SMARTALIGN_3D_DEFAULT_CLEARANCE_M = 1.0
 
 
 def extension_of(name):
@@ -365,76 +362,6 @@ def lonlat_to_world(lon, lat, target_crs):
     return float(xs[0]), float(ys[0])
 
 
-def utm_crs_from_lonlat(lon, lat):
-    lon = float(lon)
-    lat = float(lat)
-    zone = int((lon + 180.0) / 6.0) + 1
-    zone = max(1, min(60, zone))
-    epsg = 32600 + zone if lat >= 0 else 32700 + zone
-    return "EPSG:{}".format(epsg)
-
-
-def map_reference_points_lonlat(points):
-    lon_values = []
-    lat_values = []
-    for point in points or []:
-        reference = point.get("reference") if isinstance(point, dict) else None
-        if not isinstance(reference, dict):
-            continue
-        if "lat" not in reference or "lng" not in reference:
-            continue
-        try:
-            lat_values.append(float(reference.get("lat")))
-            lon_values.append(float(reference.get("lng")))
-        except (TypeError, ValueError):
-            continue
-    return lon_values, lat_values
-
-
-def choose_smartalign_target_crs(points, reference_meta, ortho_meta):
-    lon_values, lat_values = map_reference_points_lonlat(points)
-    if lon_values and lat_values:
-        return utm_crs_from_lonlat(
-            sum(lon_values) / len(lon_values),
-            sum(lat_values) / len(lat_values)
-        )
-    if reference_meta and reference_meta.get("crs"):
-        return reference_meta.get("crs")
-    return (ortho_meta or {}).get("crs") or "EPSG:4326"
-
-
-def geodetic_to_ecef(lon, lat, height=0.0):
-    a = 6378137.0
-    e2 = 6.6943799901413165e-3
-    lon_rad = math.radians(float(lon))
-    lat_rad = math.radians(float(lat))
-    sin_lat = math.sin(lat_rad)
-    cos_lat = math.cos(lat_rad)
-    n = a / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
-    h = float(height or 0.0)
-    x = (n + h) * cos_lat * math.cos(lon_rad)
-    y = (n + h) * cos_lat * math.sin(lon_rad)
-    z = (n * (1.0 - e2) + h) * sin_lat
-    return x, y, z
-
-
-def enu_basis(lon, lat):
-    lon_rad = math.radians(float(lon))
-    lat_rad = math.radians(float(lat))
-    sin_lon = math.sin(lon_rad)
-    cos_lon = math.cos(lon_rad)
-    sin_lat = math.sin(lat_rad)
-    cos_lat = math.cos(lat_rad)
-    east = (-sin_lon, cos_lon, 0.0)
-    north = (-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat)
-    up = (cos_lat * cos_lon, cos_lat * sin_lon, sin_lat)
-    return east, north, up
-
-
-def dot3(a, b):
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-
 def solve_similarity(source, target):
     if len(source) != 2:
         raise ValueError("Для similarity-трансформації потрібно рівно 2 точки")
@@ -552,31 +479,6 @@ def parse_obj_vertex(line):
         return None
 
 
-def parse_odm_orthophoto_corners_text(text):
-    parts = [part for part in (text or "").strip().split() if part]
-    if len(parts) != 4:
-        raise ValueError("odm_orthophoto_corners.txt має містити рівно 4 float-значення: xmin ymin xmax ymax")
-    try:
-        xmin, ymin, xmax, ymax = [float(value) for value in parts]
-    except ValueError as e:
-        raise ValueError("Не вдалося прочитати corners floats: {}".format(e))
-    if not all(math.isfinite(value) for value in (xmin, ymin, xmax, ymax)):
-        raise ValueError("Corners містить NaN/Inf")
-    if xmin >= xmax or ymin >= ymax:
-        raise ValueError("Corners дегенеративний: xmin<xmax і ymin<ymax обов'язкові")
-    return {
-        "xmin": xmin,
-        "ymin": ymin,
-        "xmax": xmax,
-        "ymax": ymax
-    }
-
-
-def alignment_hash(alignment):
-    payload = json.dumps(alignment or {}, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
 def quality_status(rmse):
     if rmse < 1.0:
         return "GOOD"
@@ -637,15 +539,6 @@ class SmartAlignMixin(object):
             })
 
         @login_required
-        def cesium_page(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            return render(request, self.template_path("cesium.html"), {
-                "title": "Smartpoint Cesium",
-                "project_id": project_id,
-                "task_id": task_id
-            })
-
-        @login_required
         @require_GET
         def task_info(request, project_id, task_id):
             task = self.get_task(request, project_id, task_id)
@@ -667,8 +560,7 @@ class SmartAlignMixin(object):
                 "replacement": self.public_replacement_metadata(self.load_replacement(task)),
                 "replacement_3d": self.public_replacement_3d_metadata(self.load_replacement_3d(task)),
                 "alignment_3d": self.load_alignment_3d(task),
-                "three_d": self.public_3d_status(task),
-                "cesium": self.get_cesium_3d_status(task)
+                "three_d": self.public_3d_status(task)
             })
 
         @login_required
@@ -727,40 +619,6 @@ class SmartAlignMixin(object):
             return JsonResponse({"orthophotos": items})
 
         @login_required
-        @require_GET
-        def cesium_status(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            return JsonResponse(self.get_cesium_3d_status(task))
-
-        @login_required
-        @require_POST
-        def cesium_preview(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            try:
-                payload = read_json_body(request) if request.body else {}
-                job = self.start_cesium_3d_preview_background(task, "manual", bool(payload.get("force")))
-                return JsonResponse({"success": True, "job": job, "cesium": self.get_cesium_3d_status(task)})
-            except ValueError as e:
-                return HttpResponseBadRequest(str(e))
-            except Exception as e:
-                logger.exception("SmartAlign Cesium preview failed")
-                return HttpResponseBadRequest("Не вдалося створити Cesium preview: {}".format(e))
-
-        @login_required
-        @require_POST
-        def cesium_height(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            try:
-                payload = read_json_body(request)
-                result = self.save_cesium_height_offset(task, payload.get("height_offset_m"))
-                return JsonResponse({"success": True, "alignment_3d": result, "cesium": self.get_cesium_3d_status(task)})
-            except ValueError as e:
-                return HttpResponseBadRequest(str(e))
-            except Exception as e:
-                logger.exception("SmartAlign Cesium height save failed")
-                return HttpResponseBadRequest("Не вдалося зберегти висоту Cesium: {}".format(e))
-
-        @login_required
         @require_POST
         def upload_reference(request, project_id, task_id):
             task = self.get_task(request, project_id, task_id)
@@ -802,13 +660,7 @@ class SmartAlignMixin(object):
             try:
                 payload = read_json_body(request)
                 result = self.apply_alignment(task, payload.get("points") or [])
-                return JsonResponse({
-                    "success": True,
-                    "alignment": result,
-                    "alignment_3d": self.load_alignment_3d(task),
-                    "three_d": self.public_3d_status(task),
-                    "cesium": self.get_cesium_3d_status(task)
-                })
+                return JsonResponse({"success": True, "alignment": result})
             except ValueError as e:
                 return HttpResponseBadRequest(str(e))
             except Exception as e:
@@ -825,8 +677,7 @@ class SmartAlignMixin(object):
                     result = self.align_3d_model_from_points(task, payload.get("points") or [])
                 else:
                     result = self.align_3d_model(task, payload.get("placement") or {})
-                job = self.start_cesium_3d_preview_background(task, "align_3d", True)
-                return JsonResponse({"success": True, "alignment_3d": result, "job": job, "cesium": self.get_cesium_3d_status(task)})
+                return JsonResponse({"success": True, "alignment_3d": result})
             except ValueError as e:
                 return HttpResponseBadRequest(str(e))
             except Exception as e:
@@ -845,26 +696,6 @@ class SmartAlignMixin(object):
             except Exception as e:
                 logger.exception("SmartAlign 3D Delta export failed")
                 return HttpResponseBadRequest("SmartAlign 3D Delta export failed: {}".format(e))
-
-        @login_required
-        @require_POST
-        def regenerate_3d_bridge(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            try:
-                bridge = self.regenerate_3d_bridge(task)
-                self.invalidate_3d_alignment(task)
-                return JsonResponse({
-                    "success": True,
-                    "bridge": bridge,
-                    "three_d": self.public_3d_status(task),
-                    "alignment_3d": self.load_alignment_3d(task),
-                    "replacement_3d": self.public_replacement_3d_metadata(self.load_replacement_3d(task))
-                })
-            except ValueError as e:
-                return HttpResponseBadRequest(str(e))
-            except Exception as e:
-                logger.exception("SmartAlign regenerate 3D bridge failed")
-                return HttpResponseBadRequest("Не вдалося відновити 3D bridge: {}".format(e))
 
         @login_required
         @require_POST
@@ -1002,40 +833,22 @@ class SmartAlignMixin(object):
             content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
             return FileResponse(open(file_path, "rb"), filename=os.path.basename(file_path), content_type=content_type)
 
-        @login_required
-        @require_GET
-        def terrain_3d_surface(request, project_id, task_id):
-            task = self.get_task(request, project_id, task_id)
-            try:
-                return JsonResponse(self.build_3d_terrain_surface(task))
-            except ValueError as e:
-                return JsonResponse({"available": False, "reason": str(e)})
-            except Exception as e:
-                logger.exception("SmartAlign 3D terrain surface failed")
-                return JsonResponse({"available": False, "reason": "Не вдалося побудувати DEM surface: {}".format(e)})
-
         return [
             MountPoint("smartalign/$", dashboard),
             MountPoint("align/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/$", align_page),
-            MountPoint("cesium/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/$", cesium_page),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/$", task_info),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/status/$", task_status),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/orthophotos/$", orthophotos),
-            MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/cesium-3d/$", cesium_status),
-            MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/cesium-3d/preview/$", cesium_preview),
-            MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/cesium-3d/height/$", cesium_height),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/reference/$", upload_reference),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/apply/$", apply_alignment),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/align-3d/$", align_3d),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/delta-3d/$", delta_3d),
-            MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/regenerate-3d-bridge/$", regenerate_3d_bridge),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/replace-3d/$", replace_3d),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/restore-3d/$", restore_3d),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/apply-replacement/$", apply_replacement),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/replace/$", replace_orthophoto),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/restore-replacement/$", restore_replacement),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/restore/$", restore_orthophoto),
-            MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/terrain-3d-surface/$", terrain_3d_surface),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/source-3d/(?P<filename>.+)$", source_3d_file),
             MountPoint("api/project/(?P<project_id>[^/]+)/task/(?P<task_id>[^/]+)/file/(?P<filename>.+)$", smartalign_file)
         ]
@@ -1097,38 +910,6 @@ class SmartAlignMixin(object):
             logger.warning("SmartAlign could not read %s", path)
             return None
 
-    def delete_json(self, task, name):
-        path = safe_child(self.smartalign_dir(task), name)
-        if os.path.isfile(path):
-            os.remove(path)
-
-    def smartalign_text_path(self, task, filename):
-        return safe_child(self.smartalign_dir(task), filename)
-
-    def save_text_asset(self, task, filename, text):
-        path = self.smartalign_text_path(task, filename)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-        return path
-
-    def invalidate_3d_alignment(self, task):
-        self.delete_json(task, "alignment_3d.json")
-        self.delete_json(task, "transform_3d.json")
-        self.delete_json(task, "delta_3d.json")
-        self.delete_json(task, "cesium_3d.json")
-        self.delete_json(task, "cesium_3d_job.json")
-        for folder_name in ("cesium_3d", "delta_3d", "softtools_3d"):
-            folder_path = safe_child(self.smartalign_dir(task), folder_name)
-            if os.path.isdir(folder_path):
-                shutil.rmtree(folder_path)
-        replacement = self.load_json(task, "replacement_3d.json")
-        if replacement and replacement.get("active"):
-            replacement["stale"] = True
-            replacement["stale_reason"] = "2D alignment або 3D bridge змінився після застосування 3D моделі."
-            self.save_json(task, "replacement_3d.json", replacement)
-        else:
-            self.delete_json(task, "replacement_3d.json")
-
     def public_reference_metadata(self, metadata):
         if not metadata:
             return None
@@ -1176,19 +957,6 @@ class SmartAlignMixin(object):
             ("odm_texturing/odm_textured_model.obj", ("odm_texturing", "odm_textured_model.obj")),
             ("odm_texturing_25d/odm_textured_model.obj", ("odm_texturing_25d", "odm_textured_model.obj")),
         ], lambda path: self.inspect_obj_asset(path, ortho_meta))
-        replacement_3d = self.load_replacement_3d(task) or {}
-        if obj.get("exists") and replacement_3d.get("active"):
-            try:
-                original_obj = self.find_original_3d_obj_source(task)
-                current_obj = task.assets_path("odm_texturing", obj.get("name") or "")
-                if original_obj and os.path.isfile(original_obj) and os.path.abspath(original_obj) != os.path.abspath(current_obj):
-                    original_inspection = self.inspect_obj_asset(original_obj, ortho_meta)
-                    obj.update(original_inspection)
-                    obj["path"] = os.path.relpath(original_obj, task.assets_path(""))
-                    obj["name"] = os.path.basename(original_obj)
-                    obj["diagnostic"] = "{} Original OBJ взято з 3D backup, бо активна SmartAlign replacement.".format(obj.get("diagnostic") or "")
-            except Exception:
-                logger.warning("SmartAlign could not inspect original 3D OBJ from backup", exc_info=True)
         glb = self.inspect_first_asset(task, "GLB", [
             ("odm_texturing/odm_textured_model_geo.glb", ("odm_texturing", "odm_textured_model_geo.glb")),
             ("odm_texturing_25d/odm_textured_model_geo.glb", ("odm_texturing_25d", "odm_textured_model_geo.glb")),
@@ -1221,30 +989,29 @@ class SmartAlignMixin(object):
         blockers = []
         available = False
         mode = None
-        bridge = None
         if obj.get("exists") and obj.get("coordinate_status") == "crs_like":
             available = True
             mode = "direct_crs"
-            reason = "OBJ можна перенести вслід за ортофото; X/Y схожі на CRS ортофото, висота буде anchored до terrain під час експорту."
+            reason = "OBJ можна перенести вслід за ортофото; X/Y схожі на CRS ортофото, Z буде залишено без змін."
         elif obj.get("exists"):
             coords_offset = self.read_odm_georeferencing_coords(task)
             alignment = self.load_alignment(task)
             bridge = self.find_orthophoto_local_bridge(task, obj.get("bounds"), ortho_meta)
             if self.is_authoritative_orthophoto_bridge(bridge):
                 available = True
-                mode = "local_to_orthophoto_pixel_to_map"
-                reason = "OBJ локальний; SmartAlign точно переносить X/Y через odm_orthophoto_corners.txt і alignment.raster_transform. Висота буде anchored до terrain з невеликим clearance."
+                mode = "local_orthophoto_bridge"
+                reason = "OBJ локальний; SmartAlign бере yaw з ортофото: local X/Y -> pixel ортофото -> SmartAlign map. Z буде залишено без змін."
                 obj["bridge"] = bridge
             elif coords_offset and self.coords_offset_matches_alignment(coords_offset, alignment):
                 available = True
                 mode = "coords_offset"
-                reason = "OBJ локальний, але ODM має coords.txt: local X/Y + CRS offset -> SmartAlign map. Висота буде anchored до terrain під час експорту."
+                reason = "OBJ локальний, але ODM має coords.txt: local X/Y + CRS offset -> SmartAlign map. Z буде залишено без змін."
                 obj["coords_offset"] = coords_offset
             else:
                 if bridge.get("available"):
                     available = True
-                    mode = bridge.get("method") or "obj_bounds_fallback"
-                    reason = "OBJ локальний, але точного 3D bridge немає. Поточний bridge є preview-only і не підходить для застосування або Delta/SLPK export."
+                    mode = "local_orthophoto_bridge"
+                    reason = "OBJ локальний, але його можна перенести через ортофото: local X/Y -> pixel ортофото -> SmartAlign map. Z буде залишено без змін."
                     obj["bridge"] = bridge
                 else:
                     blockers.append(obj.get("diagnostic") or "OBJ знайдено, але координати не схожі на CRS ортофото.")
@@ -1276,9 +1043,6 @@ class SmartAlignMixin(object):
             "source": obj.get("name"),
             "reason": reason,
             "blockers": blockers,
-            "bridge_status": bridge.get("status") if isinstance(bridge, dict) else "",
-            "bridge_authoritative": bool(self.is_authoritative_orthophoto_bridge(bridge)) if isinstance(bridge, dict) else False,
-            "bridge_regenerate_supported": bool((bridge or {}).get("bridge_regenerate_supported")) if isinstance(bridge, dict) else False,
             "viewer": viewer,
             "orthophoto": {
                 "crs": ortho_meta.get("crs") if ortho_meta else "",
@@ -1289,196 +1053,10 @@ class SmartAlignMixin(object):
             "assets": assets
         }
 
-    def find_odm_orthophoto_corners_source(self, task):
-        candidates = [
-            self.smartalign_text_path(task, "odm_orthophoto_corners.txt"),
-            task.assets_path("odm_orthophoto", "odm_orthophoto_corners.txt"),
-        ]
-        try:
-            candidates.append(task.task_path("odm_orthophoto", "odm_orthophoto_corners.txt"))
-        except Exception:
-            pass
-
-        log = self.load_task_log(task)
-        project_path = None
-        if isinstance(log, dict):
-            options = log.get("options") or {}
-            project_path = options.get("project_path")
-        if project_path:
-            candidates.append(os.path.join(project_path, "odm_orthophoto", "odm_orthophoto_corners.txt"))
-
-        for path in candidates:
-            if path and os.path.isfile(path):
-                return path
-        return ""
-
-    def ensure_smartalign_corners_asset(self, task):
-        source_path = self.find_odm_orthophoto_corners_source(task)
-        if not source_path:
-            raise ValueError("Не знайдено odm_orthophoto_corners.txt. Натисніть Оновити 3D bridge або перезапустіть ODM stage odm_orthophoto.")
-
-        with open(source_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-        corners = parse_odm_orthophoto_corners_text(text)
-
-        target_path = self.smartalign_text_path(task, "odm_orthophoto_corners.txt")
-        if os.path.abspath(source_path) != os.path.abspath(target_path):
-            self.save_text_asset(task, "odm_orthophoto_corners.txt", text)
-        return target_path, corners
-
-    def load_authoritative_bridge(self, task):
-        bridge = self.load_json(task, "bridge.json")
-        if not bridge or not bridge.get("authoritative"):
-            return None
-        alignment = self.load_alignment(task)
-        if bridge.get("alignment_hash") != alignment_hash(alignment):
-            return None
-        return bridge
-
-    def build_authoritative_bridge(self, task, obj_bounds=None, ortho_meta=None):
-        if not ortho_meta:
-            ortho_meta = self.ensure_orthophoto_preview(task)
-        width = int(ortho_meta.get("width") or 0)
-        height = int(ortho_meta.get("height") or 0)
-        if width <= 0 or height <= 0:
-            raise ValueError("Неможливо визначити розмір ортофото для local->pixel bridge.")
-
-        alignment = self.load_alignment(task)
-        if not alignment:
-            raise ValueError("Спочатку розрахуйте прив'язку ортофото: alignment.raster_transform ще не побудований.")
-        raster_transform = alignment.get("raster_transform")
-        if not raster_transform or len(raster_transform) < 6:
-            raise ValueError("alignment.raster_transform відсутній або неповний.")
-        map_crs = str(alignment.get("crs") or "").strip()
-        if not map_crs:
-            raise ValueError("Map CRS для aligned orthophoto не визначений; 3D bridge не може бути authoritative.")
-
-        corners_path, corners = self.ensure_smartalign_corners_asset(task)
-        local_bounds = [corners["xmin"], corners["ymin"], corners["xmax"], corners["ymax"]]
-        if obj_bounds and len(obj_bounds) == 4 and self.bounds_compatible(obj_bounds, local_bounds) is False:
-            raise ValueError("odm_orthophoto_corners.txt не сумісний з local OBJ bounds.")
-
-        source_obj = ""
-        try:
-            source_obj = self.find_original_3d_obj_source(task)
-        except Exception:
-            source_obj = ""
-
-        bridge = {
-            "version": 1,
-            "available": True,
-            "authoritative": True,
-            "status": "authoritative",
-            "method": "local_to_orthophoto_pixel_to_map",
-            "source": "odm_orthophoto_corners",
-            "obj_path": os.path.relpath(source_obj, task.assets_path("")) if source_obj else "",
-            "orthophoto_path": "odm_orthophoto/odm_orthophoto.tif",
-            "corners_path": os.path.relpath(corners_path, task.assets_path("")) if corners_path else "",
-            "corners_local": corners,
-            "bounds": local_bounds,
-            "orthophoto_size": [width, height],
-            "ortho_size": {"width": width, "height": height},
-            "local_to_pixel_transform": None,
-            "local_to_pixel_mapping": "odm_corners_flip_xy",
-            "pixel_to_map_affine": [float(value) for value in raster_transform[:6]],
-            "map_crs": map_crs,
-            "alignment_hash": alignment_hash(alignment),
-            "z_policy": "terrain_anchor_plus_user_clearance",
-            "diagnostic": "authoritative bridge from corners + alignment.raster_transform"
-        }
-        self.save_json(task, "bridge.json", bridge)
-        return bridge
-
-    def regenerate_3d_bridge(self, task):
-        source_obj = self.find_original_3d_obj_source(task)
-        ortho_meta = self.ensure_orthophoto_preview(task)
-        obj_inspection = self.inspect_obj_asset(source_obj, ortho_meta)
-        try:
-            self.ensure_smartalign_corners_asset(task)
-        except ValueError:
-            self.regenerate_odm_orthophoto_corners(task, source_obj)
-            self.ensure_smartalign_corners_asset(task)
-        return self.build_authoritative_bridge(task, obj_inspection.get("bounds"), ortho_meta)
-
-    def find_odm_orthophoto_binary(self):
-        candidates = [
-            shutil.which("odm_orthophoto"),
-            shutil.which("odm_orthophoto.exe"),
-        ]
-        webodm_root = Path(settings.BASE_DIR)
-        apps_root = webodm_root.parent
-        candidates.extend([
-            str(apps_root / "ODX" / "SuperBuild" / "install" / "bin" / "odm_orthophoto.exe"),
-            str(apps_root / "ODX" / "SuperBuild" / "install" / "bin" / "odm_orthophoto"),
-        ])
-        for candidate in candidates:
-            if candidate and os.path.isfile(candidate):
-                return str(Path(candidate).resolve())
-        return ""
-
-    def regenerate_odm_orthophoto_corners(self, task, source_obj):
-        binary = self.find_odm_orthophoto_binary()
-        if not binary:
-            raise ValueError("Не вдалося запустити odm_orthophoto для регенерації corners: binary не знайдено.")
-        if not source_obj or not os.path.isfile(source_obj):
-            raise ValueError("Не знайдено OBJ для регенерації odm_orthophoto_corners.txt.")
-
-        output_corners = self.smartalign_text_path(task, "odm_orthophoto_corners.txt")
-        output_tif = self.smartalign_text_path(task, "odm_orthophoto_render_regen.tif")
-        log_path = self.smartalign_text_path(task, "odm_orthophoto_regen.log")
-        base_args = [
-            binary,
-            "-logFile", log_path,
-            "-outputFile", output_tif,
-            "-resolution", "20.0",
-            "-outputCornerFile", output_corners
-        ]
-        commands = [
-            base_args[:1] + ["-inputFiles", source_obj] + base_args[1:],
-            base_args[:1] + ["-inputFile", source_obj] + base_args[1:],
-        ]
-        errors = []
-        for command in commands:
-            with open(log_path, "a", encoding="utf-8", newline="\n") as log:
-                log.write("\nSmartAlign regenerate command: {}\n".format(" ".join(command)))
-                try:
-                    completed = subprocess.run(command, stdout=log, stderr=log, cwd=os.path.dirname(source_obj), shell=False, timeout=300)
-                except subprocess.TimeoutExpired:
-                    errors.append("timeout")
-                    continue
-            if completed.returncode == 0 and os.path.isfile(output_corners):
-                with open(output_corners, "r", encoding="utf-8", errors="ignore") as f:
-                    parse_odm_orthophoto_corners_text(f.read())
-                return output_corners
-            errors.append("exit {}".format(completed.returncode))
-        raise ValueError("Не вдалося запустити odm_orthophoto для регенерації corners ({}). Перевірте log-файл: {}".format(", ".join(errors), log_path))
-
-    def ensure_3d_export_not_using_preview_bridge(self, task):
-        alignment = self.load_alignment(task)
-        if not alignment:
-            return None
-        source_obj = self.find_original_3d_obj_source(task)
-        ortho_meta = self.ensure_orthophoto_preview(task)
-        obj_inspection = self.inspect_obj_asset(source_obj, ortho_meta)
-        if obj_inspection.get("coordinate_status") == "crs_like" and self.obj_vertices_match_orthophoto_bounds(source_obj, ortho_meta):
-            return {"method": "direct_crs", "authoritative": True}
-        coords_offset = self.read_odm_georeferencing_coords(task)
-        if coords_offset and self.coords_offset_matches_alignment(coords_offset, alignment):
-            return {"method": "coords_offset", "authoritative": True}
-        bridge = self.find_orthophoto_local_bridge(task, obj_inspection.get("bounds"), ortho_meta)
-        if self.is_authoritative_orthophoto_bridge(bridge):
-            return bridge
-        raise ValueError(
-            "Delta 3D export заблоковано: точного 3D bridge немає. "
-            "Поточний bridge preview-only або відсутній. Натисніть Оновити 3D bridge та повторіть експорт."
-        )
-
     def find_orthophoto_local_bridge(self, task, obj_bounds=None, ortho_meta=None):
         if not ortho_meta:
             return {
                 "available": False,
-                "authoritative": False,
-                "status": "blocked_no_orthophoto",
                 "reason": "Немає metadata ортофото для local->pixel bridge."
             }
 
@@ -1487,56 +1065,63 @@ class SmartAlignMixin(object):
         if width <= 0 or height <= 0:
             return {
                 "available": False,
-                "authoritative": False,
-                "status": "blocked_no_orthophoto",
                 "reason": "Неможливо визначити розмір ортофото для local->pixel bridge."
             }
 
-        stale_bridge = self.load_json(task, "bridge.json")
-        try:
-            return self.build_authoritative_bridge(task, obj_bounds, ortho_meta)
-        except ValueError as e:
-            corners_error = str(e)
+        local_meta = self.read_orthophoto_local_metadata(task)
+        if local_meta and local_meta.get("bounds"):
+            local_bounds = local_meta.get("bounds")
+            compatible = True
+            if obj_bounds and len(obj_bounds) == 4:
+                compatible = self.bounds_compatible(obj_bounds, local_bounds) is True
+            if compatible:
+                left, bottom, right, top = [float(value) for value in local_bounds]
+                if abs(right - left) > 0 and abs(top - bottom) > 0:
+                    return {
+                        "available": True,
+                        "source": "orthophoto_geotransform" if local_meta.get("local_to_pixel_transform") else "odm_orthophoto_corners.txt",
+                        "bounds": [left, bottom, right, top],
+                        "orthophoto_size": [width, height],
+                        "local_to_pixel_transform": local_meta.get("local_to_pixel_transform"),
+                        "local_to_pixel_mapping": None if local_meta.get("local_to_pixel_transform") else "odm_corners_flip_xy",
+                        "z_policy": "preserved",
+                        "method": "local_to_orthophoto_pixel_to_map"
+                    }
 
-        if not obj_bounds or len(obj_bounds) != 4:
+        bounds = self.read_orthophoto_local_bounds(task)
+        source = "odm_orthophoto_corners.txt"
+        if not bounds:
+            bounds = obj_bounds
+            source = "obj_bounds_fallback"
+        if not bounds or len(bounds) != 4:
             return {
                 "available": False,
-                "authoritative": False,
-                "status": "stale_needs_rebuild" if stale_bridge else "missing_corners_regeneratable",
-                "bridge_regenerate_supported": True,
-                "reason": corners_error or "Немає local bounds OBJ для preview bridge."
+                "reason": "Немає local bounds ортофото/OBJ для побудови bridge."
             }
 
-        left, bottom, right, top = [float(value) for value in obj_bounds]
+        left, bottom, right, top = [float(value) for value in bounds]
         if abs(right - left) <= 0 or abs(top - bottom) <= 0:
             return {
                 "available": False,
-                "authoritative": False,
-                "status": "blocked_no_obj",
                 "reason": "Local bounds вироджені, bridge небезпечний."
             }
 
         return {
             "available": True,
-            "authoritative": False,
-            "status": "preview_only_bounds_fallback",
-            "source": "obj_bounds_fallback",
+            "source": source,
             "bounds": [left, bottom, right, top],
             "orthophoto_size": [width, height],
             "local_to_pixel_transform": None,
-            "local_to_pixel_mapping": "bounds_top_left",
-            "z_policy": "preview_only",
-            "method": "obj_bounds_fallback",
-            "reason": "Точний 3D bridge відсутній. Поточний режим preview-only і не підходить для Delta/SLPK export."
+            "local_to_pixel_mapping": "odm_corners_flip_xy" if source == "odm_orthophoto_corners.txt" else "bounds_top_left",
+            "z_policy": "preserved",
+            "method": "local_to_orthophoto_pixel_to_map"
         }
 
     def is_authoritative_orthophoto_bridge(self, bridge):
         return bool(
             bridge and
             bridge.get("available") and
-            bridge.get("authoritative") is True and
-            bridge.get("source") == "odm_orthophoto_corners" and
-            bridge.get("method") == "local_to_orthophoto_pixel_to_map"
+            bridge.get("source") != "obj_bounds_fallback"
         )
 
     def read_orthophoto_local_metadata(self, task):
@@ -1575,11 +1160,29 @@ class SmartAlignMixin(object):
         return None
 
     def read_orthophoto_local_bounds(self, task):
-        try:
-            _path, corners = self.ensure_smartalign_corners_asset(task)
-            return [corners["xmin"], corners["ymin"], corners["xmax"], corners["ymax"]]
-        except Exception as e:
-            logger.warning("SmartAlign could not read authoritative orthophoto corners: %s", e)
+        candidates = [
+            task.assets_path("odm_orthophoto", "odm_orthophoto_corners.txt"),
+        ]
+
+        log = self.load_task_log(task)
+        project_path = None
+        if isinstance(log, dict):
+            options = log.get("options") or {}
+            project_path = options.get("project_path")
+        if project_path:
+            candidates.append(os.path.join(project_path, "odm_orthophoto", "odm_orthophoto_corners.txt"))
+
+        for path in candidates:
+            try:
+                if not path or not os.path.isfile(path):
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    values = [float(value) for value in f.read().strip().split()]
+                if len(values) >= 4:
+                    left, bottom, right, top = values[:4]
+                    return [float(left), float(bottom), float(right), float(top)]
+            except Exception:
+                logger.warning("SmartAlign could not read orthophoto local bounds from %s", path)
         return None
 
     def load_task_log(self, task):
@@ -1760,212 +1363,6 @@ class SmartAlignMixin(object):
                 "assets": {}
             }
 
-    def get_cesium_3d_status(self, task):
-        alignment_3d = self.load_json(task, "alignment_3d.json") or {}
-        cesium_preview = self.load_json(task, "cesium_3d.json") or {}
-        job = self.load_json(task, "cesium_3d_job.json") or {}
-        lock_path = self.smartalign_text_path(task, "cesium_3d.lock")
-        lock_active = os.path.isfile(lock_path)
-        if lock_active and job.get("status") not in ("queued", "running"):
-            job = {
-                "status": "running",
-                "message": "Cesium preview генерується...",
-                "started_at": datetime.utcfromtimestamp(os.path.getmtime(lock_path)).isoformat() + "Z"
-            }
-        delta_3d = alignment_3d.get("delta_3d") or self.load_json(task, "delta_3d.json") or {}
-        outputs = delta_3d.get("outputs") or {}
-        preview_tileset_path = safe_child(self.smartalign_dir(task), "cesium_3d", "3d_tiles", "model", "tileset.json")
-        delta_tileset_path = safe_child(self.smartalign_dir(task), "delta_3d", "3d_tiles", "model", "tileset.json")
-        if os.path.isfile(preview_tileset_path):
-            tileset_path = preview_tileset_path
-            tileset_url = self.api_url(task, "file/cesium_3d/3d_tiles/model/tileset.json")
-            source = "cesium_preview"
-        else:
-            tileset_path = delta_tileset_path
-            tileset_url = outputs.get("tileset") or self.api_url(task, "file/delta_3d/3d_tiles/model/tileset.json")
-            source = "delta_export"
-        reference = delta_3d.get("reference") or {}
-        if cesium_preview.get("reference"):
-            reference = cesium_preview.get("reference")
-        if not reference:
-            softtools = alignment_3d.get("softtools_3d") or {}
-            reference = softtools.get("reference") or {}
-        height_offset = self.terrain_clearance_from_alignment(alignment_3d) if alignment_3d else SMARTALIGN_3D_DEFAULT_CLEARANCE_M
-        generating = lock_active or job.get("status") in ("queued", "running")
-        reason = ""
-        if not os.path.isfile(tileset_path):
-            reason = job.get("message") if generating else "Cesium preview потребує 3D Tiles. Генерація запускається автоматично після прив'язки 3D."
-        return {
-            "available": os.path.isfile(tileset_path),
-            "reason": reason,
-            "tileset_url": tileset_url if os.path.isfile(tileset_path) else "",
-            "tileset_path": tileset_path if os.path.isfile(tileset_path) else "",
-            "source": source if os.path.isfile(tileset_path) else "",
-            "reference": reference,
-            "height_offset_m": height_offset,
-            "preview": cesium_preview,
-            "job": job,
-            "generating": generating,
-            "alignment_3d": self.load_alignment_3d(task),
-            "terrain": {
-                "provider": "Esri World Elevation",
-                "requires_ion_token": False
-            }
-        }
-
-    def save_cesium_3d_job(self, task, status, message="", extra=None):
-        payload = {
-            "status": status,
-            "message": message,
-            "updated_at": datetime.utcnow().isoformat() + "Z"
-        }
-        if extra:
-            payload.update(extra)
-        self.save_json(task, "cesium_3d_job.json", payload)
-        return payload
-
-    def start_cesium_3d_preview_background(self, task, reason="manual", force=False):
-        lock_path = self.smartalign_text_path(task, "cesium_3d.lock")
-        if os.path.isfile(lock_path):
-            return self.save_cesium_3d_job(task, "running", "Cesium preview вже генерується...", {"reason": reason})
-
-        preview_tileset_path = safe_child(self.smartalign_dir(task), "cesium_3d", "3d_tiles", "model", "tileset.json")
-        if force:
-            self.delete_json(task, "cesium_3d.json")
-            preview_dir = safe_child(self.smartalign_dir(task), "cesium_3d")
-            if os.path.isdir(preview_dir):
-                shutil.rmtree(preview_dir)
-        if os.path.isfile(preview_tileset_path) and not force:
-            return self.save_cesium_3d_job(task, "succeeded", "Cesium preview готовий.", {"reason": reason})
-
-        project_id = task.project_id
-        task_id = task.id
-        self.save_cesium_3d_job(task, "queued", "Cesium preview поставлено в чергу...", {"reason": reason})
-
-        def runner():
-            close_old_connections()
-            try:
-                bg_task = models.Task.objects.get(project_id=project_id, id=task_id)
-                self.save_cesium_3d_job(bg_task, "running", "Генерується Cesium preview 3D Tiles...", {"reason": reason, "started_at": datetime.utcnow().isoformat() + "Z"})
-                preview = self.create_cesium_3d_preview(bg_task)
-                self.save_cesium_3d_job(bg_task, "succeeded", "Cesium preview готовий.", {"reason": reason, "finished_at": datetime.utcnow().isoformat() + "Z", "tileset_url": preview.get("tileset_url")})
-            except Exception as e:
-                logger.exception("SmartAlign background Cesium preview failed")
-                try:
-                    bg_task = models.Task.objects.get(project_id=project_id, id=task_id)
-                    self.save_cesium_3d_job(bg_task, "failed", "Не вдалося створити Cesium preview: {}".format(e), {"reason": reason, "finished_at": datetime.utcnow().isoformat() + "Z"})
-                except Exception:
-                    logger.exception("SmartAlign could not save failed Cesium job status")
-            finally:
-                close_old_connections()
-
-        thread = threading.Thread(target=runner, name="smartalign-cesium-{}".format(task_id), daemon=True)
-        thread.start()
-        return self.load_json(task, "cesium_3d_job.json") or {}
-
-    def create_cesium_3d_preview(self, task):
-        self.ensure_3d_export_not_using_preview_bridge(task)
-        alignment_3d = self.load_json(task, "alignment_3d.json")
-        if self.alignment_3d_needs_tile_rebuild(alignment_3d):
-            placement = (alignment_3d or {}).get("placement") or {}
-            self.align_3d_model(task, placement)
-            alignment_3d = self.load_json(task, "alignment_3d.json")
-        if not alignment_3d:
-            raise ValueError("SmartAlign aligned 3D model is not available")
-
-        lock_path = self.smartalign_text_path(task, "cesium_3d.lock")
-        try:
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            raise ValueError("Cesium preview вже генерується. Дочекайтесь завершення або оновіть сторінку через хвилину.")
-        try:
-            os.write(lock_fd, datetime.utcnow().isoformat().encode("utf-8"))
-        finally:
-            os.close(lock_fd)
-
-        preview_dir = safe_child(self.smartalign_dir(task), "cesium_3d")
-        try:
-            if os.path.isdir(preview_dir):
-                shutil.rmtree(preview_dir)
-            os.makedirs(preview_dir, exist_ok=True)
-
-            artifacts = self.prepare_smartalign_softtools_3d_artifacts(task, alignment_3d)
-            source_obj = artifacts["delta_source"]["source_obj"]
-            reference = artifacts["reference"]
-            obj2tiles_flags = artifacts["delta_source"].get("obj2tiles_flags", [])
-            obj2tiles = self.find_delta_3d_obj2tiles()
-
-            tiles_root = safe_child(preview_dir, "3d_tiles", "model")
-            os.makedirs(safe_child(tiles_root, ".temp"), exist_ok=True)
-            self.run_delta_3d_process([
-                obj2tiles,
-                source_obj,
-                tiles_root,
-                "--divisions",
-                "1",
-                "--lat",
-                str(reference["latitude"]),
-                "--lon",
-                str(reference["longitude"]),
-                "--alt",
-                str(reference["altitude"])
-            ] + obj2tiles_flags, cwd=os.path.dirname(source_obj), env=self.delta_3d_environment())
-
-            tileset_path = safe_child(tiles_root, "tileset.json")
-            if not os.path.isfile(tileset_path):
-                raise ValueError("Obj2Tiles completed but did not create tileset.json")
-            if hasattr(self, "set_delta_3d_tileset_gltf_up_axis"):
-                self.set_delta_3d_tileset_gltf_up_axis(tileset_path, "Z")
-
-            preview = {
-                "created_at": datetime.utcnow().isoformat() + "Z",
-                "tileset_path": tileset_path,
-                "tileset_url": self.api_url(task, "file/cesium_3d/3d_tiles/model/tileset.json"),
-                "reference": reference,
-                "terrain_clearance_m": self.terrain_clearance_from_alignment(alignment_3d),
-                "source_kind": "SmartAlign Cesium preview 3D Tiles",
-                "obj2tiles_flags": obj2tiles_flags,
-                "axis_convention": artifacts["delta_source"].get("axis_convention")
-            }
-            self.save_json(task, "cesium_3d.json", preview)
-            return preview
-        finally:
-            if os.path.isfile(lock_path):
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
-
-    def save_cesium_height_offset(self, task, height_offset_m):
-        try:
-            height_offset = float(height_offset_m)
-        except (TypeError, ValueError):
-            raise ValueError("Некоректна висота Cesium")
-        if not np.isfinite(height_offset) or height_offset < -10000 or height_offset > 10000:
-            raise ValueError("Висота Cesium поза допустимим діапазоном")
-
-        alignment_3d = self.load_json(task, "alignment_3d.json")
-        if not alignment_3d:
-            raise ValueError("Спочатку створіть 3D alignment")
-        placement = self.normalize_3d_placement(alignment_3d.get("placement") or {})
-        placement["offset_z"] = height_offset
-        alignment_3d["placement"] = placement
-        alignment_3d["z_policy"] = "terrain_anchor_plus_clearance"
-        alignment_3d["terrain_clearance_m"] = height_offset
-        alignment_3d["height_calibrated_in"] = "cesium"
-        alignment_3d["height_calibrated_at"] = datetime.utcnow().isoformat() + "Z"
-        alignment_3d.pop("delta_3d", None)
-        self.save_json(task, "alignment_3d.json", alignment_3d)
-        self.save_json(task, "transform_3d.json", alignment_3d)
-        self.delete_json(task, "delta_3d.json")
-        self.delete_json(task, "cesium_3d.json")
-        for folder_name in ("cesium_3d", "delta_3d"):
-            folder_path = safe_child(self.smartalign_dir(task), folder_name)
-            if os.path.isdir(folder_path):
-                shutil.rmtree(folder_path)
-        self.start_cesium_3d_preview_background(task, "height")
-        return self.load_alignment_3d(task)
-
     def ensure_orthophoto_preview(self, task):
         source_path = task.get_asset_download_path("orthophoto.tif")
         if not os.path.isfile(source_path):
@@ -2004,7 +1401,7 @@ class SmartAlignMixin(object):
         pairs = [parse_point_pair(point) for point in points]
         source = np.array([[x, y] for x, y in pairs], dtype=np.float64)
         ortho_meta = self.ensure_orthophoto_preview(task)
-        target_crs = choose_smartalign_target_crs(points, reference_meta, ortho_meta)
+        target_crs = ortho_meta.get("crs") or "EPSG:4326"
         target = np.array([
             self.reference_point_to_world(point, reference_meta, target_crs)
             for point in points
@@ -2042,7 +1439,6 @@ class SmartAlignMixin(object):
             "matrix": matrix.tolist(),
             "raster_transform": list(raster_transform)[:6],
             "crs": target_crs,
-            "crs_source": "map_reference_auto_utm" if map_reference_points_lonlat(points)[0] else "reference_or_orthophoto",
             "reference_mode": self.reference_mode(points, reference_meta),
             "points": points,
             "point_count": len(points),
@@ -2070,8 +1466,9 @@ class SmartAlignMixin(object):
         with open(report_html_path, "w", encoding="utf-8") as f:
             f.write(self.render_report_html(task, alignment))
         self.save_json(task, "alignment.json", alignment)
-        self.invalidate_3d_alignment(task)
-        self.start_cesium_3d_preview_background(task, "alignment")
+        old_3d_report = safe_child(self.smartalign_dir(task), "alignment_3d.json")
+        if os.path.isfile(old_3d_report):
+            os.remove(old_3d_report)
         return alignment
 
     def ensure_aligned_preview(self, task, alignment):
@@ -2429,8 +1826,8 @@ class SmartAlignMixin(object):
         local_to_pixel_mapping = bridge.get("local_to_pixel_mapping")
         def mapper(x, y):
             if local_to_pixel_mapping == "odm_corners_flip_xy":
-                pixel_x = (float(x) - left) / span_x * width
-                pixel_y = (top - float(y)) / span_y * height
+                pixel_x = (right - float(x)) / span_x * width
+                pixel_y = (float(y) - bottom) / span_y * height
             else:
                 pixel_x = (float(x) - left) / span_x * width
                 pixel_y = (top - float(y)) / span_y * height
@@ -2516,8 +1913,8 @@ class SmartAlignMixin(object):
             ortho_meta = self.ensure_orthophoto_preview(task)
             obj_inspection = self.inspect_obj_asset(source_obj, ortho_meta)
             bridge = self.find_orthophoto_local_bridge(task, obj_inspection.get("bounds"), ortho_meta)
-        if not self.is_authoritative_orthophoto_bridge(bridge):
-            raise ValueError("SmartAlign не має authoritative local->orthophoto bridge для 3D. Bounds fallback дозволений лише для preview.")
+        if not bridge or not bridge.get("available"):
+            raise ValueError("SmartAlign не має local->orthophoto bridge для 3D")
         return self.local_orthophoto_to_map_mapper(bridge, alignment), self.local_orthophoto_to_map_scale(bridge, alignment)
 
     def zip_directory(self, source_dir, output_zip):
@@ -2787,103 +2184,6 @@ class SmartAlignMixin(object):
                 "sample": {"x": sample_x, "y": sample_y}
             }
 
-    def build_3d_terrain_surface(self, task):
-        alignment_3d = self.load_json(task, "alignment_3d.json")
-        if not alignment_3d:
-            raise ValueError("Спочатку збережіть 3D, щоб побудувати DEM surface preview.")
-        source_obj = self.find_original_3d_obj_source(task, alignment_3d.get("source_path"))
-        if not os.path.isfile(source_obj):
-            raise ValueError("Original ODM OBJ is not available")
-
-        dem_kind, dem_path = self.find_odm_dem_asset(task)
-        if not dem_path:
-            raise ValueError("Локальний DTM/DSM відсутній; non-flat surface preview недоступний.")
-
-        crs_text = str(alignment_3d.get("crs") or "").strip()
-        if not crs_text:
-            raise ValueError("SmartAlign 3D alignment has no CRS")
-        xy_mapper, z_scale = self.softtools_3d_mapper_and_scale(task, source_obj, alignment_3d)
-        if not np.isfinite(z_scale) or z_scale <= 0:
-            z_scale = 1.0
-
-        obj_meta = self.inspect_obj_asset(source_obj, self.ensure_orthophoto_preview(task))
-        bounds = obj_meta.get("bounds")
-        if not bounds or len(bounds) != 4:
-            raise ValueError("OBJ bounds недоступні для DEM surface preview.")
-        left, bottom, right, top = [float(value) for value in bounds]
-        if left >= right or bottom >= top:
-            raise ValueError("OBJ bounds вироджені для DEM surface preview.")
-
-        z_values = []
-        with open(source_obj, "r", encoding="utf-8", errors="ignore") as src:
-            for line in src:
-                vertex = parse_obj_vertex(line)
-                if not vertex:
-                    continue
-                z_values.append(vertex[2])
-                if len(z_values) >= 5000:
-                    break
-        ground_z = self.percentile_value(z_values, 2.0)
-
-        rows = 25
-        cols = 25
-        center_local_x = (left + right) / 2.0
-        center_local_y = (bottom + top) / 2.0
-        center_map_x, center_map_y = xy_mapper(center_local_x, center_local_y)
-
-        vertices = []
-        with rasterio.open(dem_path) as dataset:
-            dem_crs_text = dataset.crs.to_string() if dataset.crs else ""
-            center_sample_x = float(center_map_x)
-            center_sample_y = float(center_map_y)
-            if dataset.crs and crs_text and dem_crs_text != crs_text:
-                xs, ys = rio_transform(CRS.from_string(crs_text), dataset.crs, [center_sample_x], [center_sample_y])
-                center_sample_x = float(xs[0])
-                center_sample_y = float(ys[0])
-            center_value = next(dataset.sample([(center_sample_x, center_sample_y)], masked=True))[0]
-            center_elevation = float(center_value) if not np.ma.is_masked(center_value) and np.isfinite(float(center_value)) else 0.0
-
-            for row in range(rows):
-                t_y = row / float(rows - 1)
-                local_y = top + (bottom - top) * t_y
-                for col in range(cols):
-                    t_x = col / float(cols - 1)
-                    local_x = left + (right - left) * t_x
-                    map_x, map_y = xy_mapper(local_x, local_y)
-                    sample_x = float(map_x)
-                    sample_y = float(map_y)
-                    if dataset.crs and crs_text and dem_crs_text != crs_text:
-                        xs, ys = rio_transform(CRS.from_string(crs_text), dataset.crs, [sample_x], [sample_y])
-                        sample_x = float(xs[0])
-                        sample_y = float(ys[0])
-                    try:
-                        row_index, col_index = dataset.index(sample_x, sample_y)
-                        if row_index < 0 or col_index < 0 or row_index >= dataset.height or col_index >= dataset.width:
-                            elevation = center_elevation
-                        else:
-                            value = next(dataset.sample([(sample_x, sample_y)], masked=True))[0]
-                            elevation = center_elevation if np.ma.is_masked(value) else float(value)
-                            if not np.isfinite(elevation):
-                                elevation = center_elevation
-                    except Exception:
-                        elevation = center_elevation
-                    vertices.append([
-                        float(local_x),
-                        float(local_y),
-                        float(ground_z + ((elevation - center_elevation) / z_scale))
-                    ])
-
-        return {
-            "available": True,
-            "provider": "ODM {}".format(dem_kind.upper()),
-            "rows": rows,
-            "cols": cols,
-            "vertices": vertices,
-            "ground_z": ground_z,
-            "center_elevation": center_elevation,
-            "z_scale": z_scale
-        }
-
     def get_3d_origin_terrain_reference(self, task, map_x, map_y, crs_text, latitude, longitude):
         try:
             dem = self.get_odm_dem_elevation(task, map_x, map_y, crs_text)
@@ -2893,15 +2193,6 @@ class SmartAlignMixin(object):
         except Exception as e:
             logger.warning("SmartAlign could not sample ODM DEM for 3D origin: %s", e)
         return self.get_delta_3d_terrain_reference(latitude, longitude)
-
-    def terrain_clearance_from_alignment(self, alignment_3d):
-        if alignment_3d.get("method") == "manual_similarity_3d":
-            return 0.0
-        placement = self.normalize_3d_placement(alignment_3d.get("placement") or {})
-        clearance = float(placement.get("offset_z") or 0.0)
-        if not np.isfinite(clearance):
-            return SMARTALIGN_3D_DEFAULT_CLEARANCE_M
-        return clearance
 
     def percentile_value(self, values, percent):
         if not values:
@@ -2957,8 +2248,6 @@ class SmartAlignMixin(object):
         except Exception as e:
             raise ValueError("Could not convert SmartAlign 3D center to WGS84: {}".format(e))
         terrain = self.get_3d_origin_terrain_reference(task, center_x, center_y, crs_text, latitude, longitude)
-        terrain_clearance = self.terrain_clearance_from_alignment(alignment_3d)
-        export_altitude = float(terrain.get("elevation") or 0.0) + terrain_clearance
 
         source_dir = os.path.dirname(str(source_path))
         prepared_dir = safe_child(delta_dir, "source")
@@ -2991,15 +2280,13 @@ class SmartAlignMixin(object):
         reference = {
             "latitude": latitude,
             "longitude": longitude,
-            "altitude": export_altitude,
+            "altitude": terrain["elevation"],
             "terrain": terrain,
             "origin": {"x": center_x, "y": center_y, "z": ground_z, "crs": crs_text},
             "center": {"x": center_x, "y": center_y, "z": center_z, "crs": crs_text},
             "bounds": [min_x, min_y, min_z, max_x, max_y, max_z],
             "vertex_count": vertex_count,
-            "z_policy": "terrain_anchor_plus_clearance",
-            "terrain_elevation": float(terrain.get("elevation") or 0.0),
-            "terrain_clearance_m": terrain_clearance,
+            "z_policy": "ground_rebased_global_offset",
             "height_axis": "obj_y_from_aligned_z",
             "axis_mapping": {
                 "obj_x": "aligned_map_x_minus_origin_x",
@@ -3012,16 +2299,14 @@ class SmartAlignMixin(object):
             json.dump({
                 "latitude": latitude,
                 "longitude": longitude,
-                "altitude": export_altitude
+                "altitude": terrain["elevation"]
             }, f, ensure_ascii=False, indent=2)
         return prepared_obj, reference
 
     def create_delta_3d_export(self, task):
-        self.ensure_3d_export_not_using_preview_bridge(task)
         alignment_3d = self.load_json(task, "alignment_3d.json")
-        if self.alignment_3d_needs_tile_rebuild(alignment_3d):
-            placement = (alignment_3d or {}).get("placement") or {}
-            self.align_3d_model(task, placement)
+        if not alignment_3d:
+            self.align_3d_model(task)
             alignment_3d = self.load_json(task, "alignment_3d.json")
         if not alignment_3d:
             raise ValueError("SmartAlign aligned 3D model is not available")
@@ -3034,7 +2319,7 @@ class SmartAlignMixin(object):
         artifacts = self.prepare_smartalign_softtools_3d_artifacts(task, alignment_3d)
         source_obj = artifacts["delta_source"]["source_obj"]
         reference = artifacts["reference"]
-        obj2tiles_flags = artifacts["delta_source"].get("obj2tiles_flags", [])
+        obj2tiles_flags = artifacts["delta_source"].get("obj2tiles_flags", ["--y-up-to-z-up"])
         obj2tiles = self.find_delta_3d_obj2tiles()
         node = self.find_delta_3d_node()
         converter = self.find_delta_3d_converter()
@@ -3061,8 +2346,6 @@ class SmartAlignMixin(object):
         tileset_path = safe_child(tiles_root, "tileset.json")
         if not os.path.isfile(tileset_path):
             raise ValueError("Obj2Tiles completed but did not create tileset.json")
-        if hasattr(self, "set_delta_3d_tileset_gltf_up_axis"):
-            self.set_delta_3d_tileset_gltf_up_axis(tileset_path, "Z")
 
         self.run_delta_3d_process([
             node,
@@ -3102,18 +2385,16 @@ class SmartAlignMixin(object):
             "filename": filename,
             "source_obj": source_obj,
             "reference": reference,
-            "source_kind": "SmartAlign Delta Z-up",
-            "axis_convention": artifacts["delta_source"].get("axis_convention", "z_up_east_north_height"),
+            "source_kind": "SmartAlign Delta Y-up",
+            "axis_convention": "obj2tiles_xz_y_height",
             "obj2tiles_flags": obj2tiles_flags,
             "outputs": {
                 "slpk": self.api_url(task, "file/{}?download=1".format(filename)),
-                "reference": self.api_url(task, "file/delta_3d/source/reference_lla.json?download=1"),
-                "tileset": self.api_url(task, "file/delta_3d/3d_tiles/model/tileset.json")
+                "reference": self.api_url(task, "file/delta_3d/source/reference_lla.json?download=1")
             }
         }
         outputs = dict(result.get("outputs") or {})
         outputs["delta_slpk"] = result["delta_3d"]["outputs"]["slpk"]
-        outputs["cesium_tileset"] = result["delta_3d"]["outputs"]["tileset"]
         result["outputs"] = outputs
         self.save_json(task, "alignment_3d.json", result)
         self.save_json(task, "delta_3d.json", result["delta_3d"])
@@ -3146,12 +2427,12 @@ class SmartAlignMixin(object):
         return {
             "offset_x": number("offset_x", 0.0, -10000, 10000),
             "offset_y": number("offset_y", 0.0, -10000, 10000),
-            "offset_z": number("offset_z", SMARTALIGN_3D_DEFAULT_CLEARANCE_M, -10000, 10000),
+            "offset_z": number("offset_z", 0.0, -10000, 10000),
             "yaw_deg": number("yaw_deg", 0.0, -180, 180),
             "scale": number("scale", 1.0, 0.01, 100.0)
         }
 
-    def placed_3d_mapper(self, base_mapper, placement, anchor_x, anchor_y, z_scale=1.0, z_anchor=0.0):
+    def placed_3d_mapper(self, base_mapper, placement, anchor_x, anchor_y):
         placement = self.normalize_3d_placement(placement)
         yaw = math.radians(float(placement.get("yaw_deg") or 0.0))
         cos_yaw = math.cos(yaw)
@@ -3168,32 +2449,10 @@ class SmartAlignMixin(object):
             return (
                 anchor_x + dx * cos_yaw - dy * sin_yaw + offset_x,
                 anchor_y + dx * sin_yaw + dy * cos_yaw + offset_y,
-                (float(z) - float(z_anchor)) * float(z_scale) + offset_z
+                float(z) + offset_z
             )
 
         return mapper, placement
-
-    def obj_z_percentile(self, obj_path, percent=2.0):
-        z_values = []
-        with open(obj_path, "r", encoding="utf-8", errors="ignore") as src:
-            for line in src:
-                vertex = parse_obj_vertex(line)
-                if vertex:
-                    z_values.append(vertex[2])
-        return self.percentile_value(z_values, percent)
-
-    def alignment_3d_needs_tile_rebuild(self, alignment_3d):
-        if not alignment_3d:
-            return True
-        try:
-            z_scale = float(alignment_3d.get("z_scale") or 0.0)
-        except (TypeError, ValueError):
-            z_scale = 0.0
-        return (
-            alignment_3d.get("axis_convention_version") != 2 or
-            not np.isfinite(z_scale) or
-            z_scale <= 0.0
-        )
 
     def align_3d_model(self, task, placement=None):
         alignment = self.load_alignment(task)
@@ -3203,7 +2462,7 @@ class SmartAlignMixin(object):
         source_obj = self.find_original_3d_obj_source(task)
         ortho_meta = self.ensure_orthophoto_preview(task)
         obj_inspection = self.inspect_obj_asset(source_obj, ortho_meta)
-        direct_crs = obj_inspection.get("coordinate_status") == "crs_like" and self.obj_vertices_match_orthophoto_bounds(source_obj, ortho_meta)
+        direct_crs = self.obj_vertices_match_orthophoto_bounds(source_obj, ortho_meta)
         bridge = None
         coords_offset = None
         xy_transform = None
@@ -3211,14 +2470,12 @@ class SmartAlignMixin(object):
         if direct_crs:
             xy_transform = self.old_world_to_aligned_world_transform(task, alignment)
             xy_mapper = lambda x, y: transform_xy(xy_transform, x, y)
-            z_scale = float(abs(xy_transform.a * xy_transform.e - xy_transform.b * xy_transform.d) ** 0.5)
         else:
             bridge = self.find_orthophoto_local_bridge(task, obj_inspection.get("bounds"), ortho_meta)
             coords_offset = self.read_odm_georeferencing_coords(task)
             if self.is_authoritative_orthophoto_bridge(bridge):
                 method = "local_orthophoto_bridge"
                 xy_mapper = self.local_orthophoto_to_map_mapper(bridge, alignment)
-                z_scale = self.local_orthophoto_to_map_scale(bridge, alignment)
             elif coords_offset and self.coords_offset_matches_alignment(coords_offset, alignment):
                 xy_transform = self.old_world_to_aligned_world_transform(task, alignment)
                 offset = coords_offset.get("offset") or {}
@@ -3226,17 +2483,13 @@ class SmartAlignMixin(object):
                 offset_y = float(offset.get("y") or 0.0)
                 method = "coords_offset"
                 xy_mapper = lambda x, y: transform_xy(xy_transform, float(x) + offset_x, float(y) + offset_y)
-                z_scale = float(abs(xy_transform.a * xy_transform.e - xy_transform.b * xy_transform.d) ** 0.5)
             else:
                 if not bridge.get("available"):
                     if coords_offset and not self.coords_offset_matches_alignment(coords_offset, alignment):
                         raise ValueError("OBJ-модель має coords.txt, але CRS coords.txt не збігається з CRS прив'язки.")
-                    raise ValueError("OBJ-модель має локальні vertex-координати, але SmartAlign не знайшов authoritative local->orthophoto bridge. Потрібен odm_orthophoto_corners.txt.")
-                raise ValueError("Точний 3D bridge відсутній. Поточний режим preview-only і не підходить для Delta/SLPK export. Натисніть Оновити 3D bridge.")
-        normalized_preview = self.normalize_3d_placement(placement or {})
-        z_scale = float(z_scale or 1.0) * float(normalized_preview.get("scale") or 1.0)
-        if not np.isfinite(z_scale) or z_scale <= 0:
-            z_scale = 1.0
+                    raise ValueError("OBJ-модель має локальні vertex-координати, але SmartAlign не знайшов local->orthophoto bridge. Потрібен odm_orthophoto_corners.txt або надійні OBJ bounds.")
+                method = "local_orthophoto_bridge"
+                xy_mapper = self.local_orthophoto_to_map_mapper(bridge, alignment)
 
         obj_bounds = obj_inspection.get("bounds") or [0, 0, 0, 0]
         try:
@@ -3245,14 +2498,11 @@ class SmartAlignMixin(object):
             anchor_x, anchor_y = xy_mapper(anchor_source_x, anchor_source_y)
         except Exception:
             anchor_x = anchor_y = 0.0
-        source_ground_z = self.obj_z_percentile(source_obj, 2.0)
         placed_mapper, normalized_placement = self.placed_3d_mapper(
             xy_mapper,
             placement or {},
             float(anchor_x),
-            float(anchor_y),
-            z_scale,
-            source_ground_z
+            float(anchor_y)
         )
 
         output_dir = safe_child(self.smartalign_dir(task), "model_aligned")
@@ -3273,10 +2523,7 @@ class SmartAlignMixin(object):
             "output_path": output_obj,
             "zip_path": output_zip,
             "vertex_count": vertex_count,
-            "z_policy": "terrain_anchor_plus_clearance",
-            "z_scale": z_scale,
-            "z_anchor_source": source_ground_z,
-            "axis_convention_version": 2,
+            "z_policy": "preserved",
             "crs": alignment.get("crs"),
             "xy_transform": list(xy_transform)[:6] if xy_transform else None,
             "placement": normalized_placement,
@@ -3354,18 +2601,12 @@ class SmartAlignMixin(object):
         origin_y = (min_y + max_y) / 2.0
         ground_z = self.percentile_value(z_values, 2.0)
         try:
-            map_crs_obj = CRS.from_string(crs_text)
-            wgs84_crs_obj = CRS.from_epsg(4326)
-            lon_values, lat_values = rio_transform(map_crs_obj, wgs84_crs_obj, [origin_x], [origin_y])
+            lon_values, lat_values = rio_transform(CRS.from_string(crs_text), CRS.from_epsg(4326), [origin_x], [origin_y])
             longitude = float(lon_values[0])
             latitude = float(lat_values[0])
         except Exception as e:
             raise ValueError("Could not convert SmartAlign 3D origin to WGS84: {}".format(e))
         terrain = self.get_3d_origin_terrain_reference(task, origin_x, origin_y, crs_text, latitude, longitude)
-        terrain_clearance = self.terrain_clearance_from_alignment(alignment_3d)
-        export_altitude = float(terrain.get("elevation") or 0.0) + terrain_clearance
-        origin_ecef = geodetic_to_ecef(longitude, latitude, 0.0)
-        enu_east, enu_north, _enu_up = enu_basis(longitude, latitude)
 
         root_dir = safe_child(self.smartalign_dir(task), "softtools_3d")
         webodm_dir = safe_child(root_dir, "webodm_model")
@@ -3396,31 +2637,15 @@ class SmartAlignMixin(object):
                         continue
                     x, y, z, extra = vertex
                     mapped_x, mapped_y = xy_mapper(x, y)
-                    try:
-                        point_lon_values, point_lat_values = rio_transform(
-                            map_crs_obj,
-                            wgs84_crs_obj,
-                            [mapped_x],
-                            [mapped_y]
-                        )
-                        point_ecef = geodetic_to_ecef(float(point_lon_values[0]), float(point_lat_values[0]), 0.0)
-                        delta_ecef = (
-                            point_ecef[0] - origin_ecef[0],
-                            point_ecef[1] - origin_ecef[1],
-                            point_ecef[2] - origin_ecef[2]
-                        )
-                        rel_x = dot3(delta_ecef, enu_east)
-                        rel_y = dot3(delta_ecef, enu_north)
-                    except Exception:
-                        rel_x = mapped_x - origin_x
-                        rel_y = mapped_y - origin_y
+                    rel_x = mapped_x - origin_x
+                    rel_y = mapped_y - origin_y
                     rel_z = (z - ground_z) * z_scale
                     if axis_convention == "webodm_xy_z_height":
                         coords = [rel_x, rel_y, rel_z]
                     else:
-                        # Cesium and Obj2Tiles are safest here with an already Z-up OBJ:
-                        # X=east, Y=north, Z=height.
-                        coords = [rel_x, rel_y, rel_z]
+                        # Obj2Tiles converts Y-up OBJ coordinates to Z-up as X, -Z, Y.
+                        # Store northing as negative Z so the final Z-up Y axis keeps the SmartAlign orientation.
+                        coords = [rel_x, rel_z, -rel_y]
                     values = ["v"] + [self.format_delta_3d_obj_coord(value) for value in coords]
                     values.extend(extra)
                     dst.write(" ".join(values) + "\n")
@@ -3428,12 +2653,12 @@ class SmartAlignMixin(object):
             return written
 
         webodm_vertex_count = write_converted_obj(webodm_obj, "webodm_xy_z_height")
-        delta_vertex_count = write_converted_obj(delta_obj, "z_up_east_north_height")
+        delta_vertex_count = write_converted_obj(delta_obj, "obj2tiles_xz_y_height")
 
         reference_lla = {
             "latitude": latitude,
             "longitude": longitude,
-            "altitude": export_altitude
+            "altitude": terrain["elevation"]
         }
         reference_path = safe_child(delta_dir, "reference_lla.json")
         with open(reference_path, "w", encoding="utf-8") as f:
@@ -3468,13 +2693,11 @@ class SmartAlignMixin(object):
             "horizontal_scale": z_scale,
             "z_scale": z_scale,
             "ground_z_percentile": 2.0,
-            "z_policy": "terrain_anchor_plus_clearance",
-            "terrain_elevation": float(terrain.get("elevation") or 0.0),
-            "terrain_clearance_m": terrain_clearance,
+            "z_policy": "ground_rebased_global_offset",
             "dem": terrain,
             "coords_offset": public_coords_offset,
             "rotation_source": rotation_source,
-            "delta_z_up_mapping": "x=rel_x/east, y=rel_y/north, z=rel_z/up; Obj2Tiles receives a Z-up OBJ"
+            "delta_y_up_mapping": "x=rel_x, y=rel_z, z=-rel_y; Obj2Tiles --y-up-to-z-up restores x/east, y/north, z/up"
         }
         webodm_manifest = dict(common)
         webodm_manifest.update({
@@ -3484,11 +2707,11 @@ class SmartAlignMixin(object):
         })
         delta_manifest = dict(common)
         delta_manifest.update({
-            "axis_convention": "z_up_east_north_height",
+            "axis_convention": "obj2tiles_xz_y_height",
             "source_obj": delta_obj,
             "reference_lla": reference_path,
             "vertex_count": delta_vertex_count,
-            "obj2tiles_flags": []
+            "obj2tiles_flags": ["--y-up-to-z-up"]
         })
         root_manifest = dict(common)
         root_manifest.update({
@@ -3508,9 +2731,6 @@ class SmartAlignMixin(object):
             "created_at": created_at,
             "root_dir": root_dir,
             "reference": reference_lla,
-            "terrain": terrain,
-            "terrain_elevation": float(terrain.get("elevation") or 0.0),
-            "terrain_clearance_m": terrain_clearance,
             "webodm_model": {
                 "dir": webodm_dir,
                 "source_obj": webodm_obj,
@@ -3522,10 +2742,10 @@ class SmartAlignMixin(object):
                 "dir": delta_dir,
                 "source_obj": delta_obj,
                 "reference_lla": reference_path,
-                "axis_convention": "z_up_east_north_height",
+                "axis_convention": "obj2tiles_xz_y_height",
                 "vertex_count": delta_vertex_count,
                 "manifest": safe_child(delta_dir, "manifest.json"),
-                "obj2tiles_flags": []
+                "obj2tiles_flags": ["--y-up-to-z-up"]
             },
             "outputs": {
                 "manifest": self.api_url(task, "file/softtools_3d/manifest.json?download=1"),
@@ -3760,7 +2980,6 @@ class SmartAlignMixin(object):
         return backup_dir
 
     def replace_webodm_3d_model(self, task):
-        self.ensure_3d_export_not_using_preview_bridge(task)
         alignment_3d = self.load_json(task, "alignment_3d.json")
         if not alignment_3d:
             self.align_3d_model(task)

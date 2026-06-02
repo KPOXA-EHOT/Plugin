@@ -1,0 +1,22 @@
+{% extends "app/plugins/templates/base.html" %}
+
+{% block content %}
+<link rel="stylesheet" href="/plugins/Smartpoint/soft_tools.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Widgets/widgets.css">
+<link rel="stylesheet" href="/plugins/Smartpoint/smart_align_cesium.css?v=20260602-cesium-ui-depth2">
+<script>
+  try { window.localStorage.setItem("soft_tools_sidebar_hidden", "1"); } catch (_) {}
+  function smartalignHideSidebar() {
+    if (document.body) document.body.classList.add("soft-tools-sidebar-hidden");
+  }
+  smartalignHideSidebar();
+  window.setTimeout(smartalignHideSidebar, 0);
+  window.setTimeout(smartalignHideSidebar, 500);
+</script>
+<div id="smartalign-cesium-root"
+     data-project-id="{{ project_id }}"
+     data-task-id="{{ task_id }}"
+     data-align-url="/plugins/Smartpoint/align/project/{{ project_id }}/task/{{ task_id }}/"></div>
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Cesium.js"></script>
+<script src="/plugins/Smartpoint/smart_align_cesium.js?v=20260602-model-adjustment-ui2"></script>
+{% endblock %}

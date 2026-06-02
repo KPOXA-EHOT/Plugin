@@ -2,9 +2,6 @@
   var root = document.getElementById("smartalign-root");
   if (!root) return;
 
-  try { window.localStorage.setItem("soft_tools_sidebar_hidden", "1"); } catch (_) {}
-  if (document.body) document.body.classList.add("soft-tools-sidebar-hidden");
-
   var map = null;
   var baseLayer = null;
   var alignedOverlay = null;
@@ -23,7 +20,6 @@
   var threeRaycaster = null;
   var threePointer = null;
   var threeAnimation = null;
-  var cesiumPollTimer = null;
   var suppressNext3dPick = false;
   var BASE_MAP_NAMES = [
     "Esri Satellite", "Esri Streets", "Esri Topo", "Esri Terrain", "Esri NatGeo",
@@ -54,7 +50,7 @@
     mapInitialFitDone: false,
     previewVisible: true,
     assetWriteDirty: false,
-    placement3d: { offset_x: 0, offset_y: 0, offset_z: 1, yaw_deg: 0, scale: 1 },
+    placement3d: { offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 },
     transformMode3d: "translate",
     threeLoaded: false,
     threeError: ""
@@ -62,26 +58,6 @@
 
   function api(path) {
     return "/plugins/Smartpoint/api/project/" + encodeURIComponent(state.projectId) + "/task/" + encodeURIComponent(state.taskId) + "/" + path;
-  }
-
-  function cesiumUrl() {
-    return "/plugins/Smartpoint/cesium/project/" + encodeURIComponent(state.projectId) + "/task/" + encodeURIComponent(state.taskId) + "/";
-  }
-
-  function scheduleCesiumPolling() {
-    var cesium = state.info && state.info.cesium || {};
-    if (!cesium.generating) {
-      if (cesiumPollTimer) {
-        window.clearTimeout(cesiumPollTimer);
-        cesiumPollTimer = null;
-      }
-      return;
-    }
-    if (cesiumPollTimer) return;
-    cesiumPollTimer = window.setTimeout(function () {
-      cesiumPollTimer = null;
-      loadInfo();
-    }, 5000);
   }
 
   function getCookie(name) {
@@ -439,7 +415,7 @@
     return {
       offset_x: number("offset_x", 0, -10000, 10000),
       offset_y: number("offset_y", 0, -10000, 10000),
-      offset_z: number("offset_z", 1, -10000, 10000),
+      offset_z: number("offset_z", 0, -10000, 10000),
       yaw_deg: number("yaw_deg", 0, -180, 180),
       scale: number("scale", 1, 0.01, 100)
     };
@@ -456,13 +432,13 @@
     var placement = state.placement3d || {};
     var status = "3D від ортофото: X " + formatNumber(placement.offset_x || 0, 2) +
       " м, Y " + formatNumber(placement.offset_y || 0, 2) +
-      " м, над землею " + formatNumber(placement.offset_z || 0, 2) +
+      " м, Z " + formatNumber(placement.offset_z || 0, 2) +
       " м, поворот " + formatNumber(placement.yaw_deg || 0, 1) +
       "°, масштаб " + formatNumber(placement.scale || 1, 3);
     return '' +
       '<section class="smartalign-panel">' +
         '<div class="smartalign-3d-stage">' +
-          '<div id="smartalign-3d-viewer" class="smartalign-3d-viewer" data-obj-url="' + escapeHtml(viewer.obj_url || "") + '" data-resource-url="' + escapeHtml(viewer.resource_url || "") + '" data-mtl-path="' + escapeHtml(viewer.mtl_path || "") + '" data-terrain-url="' + escapeHtml(api("terrain-3d-surface/")) + '"></div>' +
+          '<div id="smartalign-3d-viewer" class="smartalign-3d-viewer" data-obj-url="' + escapeHtml(viewer.obj_url || "") + '" data-resource-url="' + escapeHtml(viewer.resource_url || "") + '" data-mtl-path="' + escapeHtml(viewer.mtl_path || "") + '"></div>' +
           '<div class="smartalign-3d-status">' + escapeHtml(state.threeError || status) + '</div>' +
         '</div>' +
       '</section>';
@@ -508,7 +484,7 @@
   }
 
   function render3dPlacementControls() {
-    var placement = Object.assign({ offset_x: 0, offset_y: 0, offset_z: 1, yaw_deg: 0, scale: 1 }, state.placement3d || {});
+    var placement = Object.assign({ offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 }, state.placement3d || {});
     function input(name, label, step) {
       return '' +
         '<label class="smartalign-3d-placement-field">' +
@@ -521,7 +497,7 @@
         '<div class="smartalign-3d-placement-grid">' +
           input("offset_x", "X м", "0.1") +
           input("offset_y", "Y м", "0.1") +
-          input("offset_z", "Над землею м", "0.1") +
+          input("offset_z", "Z м", "0.1") +
           input("yaw_deg", "Поворот °", "0.1") +
           input("scale", "Масштаб", "0.001") +
         '</div>' +
@@ -619,22 +595,7 @@
     if (value === "direct_crs") return "direct CRS";
     if (value === "local_orthophoto_bridge") return "через ортофото";
     if (value === "local_to_orthophoto_pixel_to_map") return "local -> orthophoto -> map";
-    if (value === "obj_bounds_fallback") return "preview only: bounds fallback";
-    if (value === "coords_offset") return "coords.txt";
     return value || "";
-  }
-
-  function current3dBridge() {
-    var threeD = state.info && state.info.three_d || {};
-    return threeD.assets && threeD.assets.obj && threeD.assets.obj.bridge || null;
-  }
-
-  function hasUnsafe3dBridge() {
-    var threeD = state.info && state.info.three_d || {};
-    var bridge = current3dBridge();
-    if (threeD.mode === "obj_bounds_fallback") return true;
-    if (!bridge || !bridge.available) return false;
-    return bridge.method === "obj_bounds_fallback" || bridge.authoritative === false;
   }
 
   function render3dAsset(key, asset) {
@@ -652,10 +613,7 @@
     if (asset.bounds_wgs84) details.push('WGS84: ' + escapeHtml(formatBounds(asset.bounds_wgs84)));
     if (asset.width && asset.height) details.push(escapeHtml(asset.width + "x" + asset.height));
     if (asset.points) details.push('points: ' + escapeHtml(asset.points));
-    if (asset.bridge && asset.bridge.available) {
-      details.push('bridge: ' + escapeHtml(localize3dMode(asset.bridge.method || "local_orthophoto_bridge")));
-      details.push(asset.bridge.authoritative ? 'authoritative' : 'preview only');
-    }
+    if (asset.bridge && asset.bridge.available) details.push('bridge: ' + escapeHtml(localize3dMode(asset.bridge.method || "local_orthophoto_bridge")));
     if (asset.error) details.push('помилка: ' + escapeHtml(asset.error));
     return '' +
       '<div class="smartalign-3d-asset found">' +
@@ -671,20 +629,6 @@
     var assets = threeD.assets || {};
     var blockers = Array.isArray(threeD.blockers) ? threeD.blockers : [];
     var ortho = threeD.orthophoto || {};
-    var bridge = assets.obj && assets.obj.bridge || {};
-    var alignment3d = state.info && state.info.alignment_3d || {};
-    var softtools3d = alignment3d.softtools_3d || {};
-    var terrain = softtools3d.reference || {};
-    var terrainDetails = [];
-    if (softtools3d.webodm_model && softtools3d.webodm_model.vertex_count) terrainDetails.push("vertices: " + escapeHtml(softtools3d.webodm_model.vertex_count));
-    if (softtools3d.terrain && softtools3d.terrain.provider) terrainDetails.push(escapeHtml(softtools3d.terrain.provider));
-    if (softtools3d.terrain_elevation != null) terrainDetails.push("земля: " + escapeHtml(formatNumber(softtools3d.terrain_elevation, 2)) + " м");
-    if (softtools3d.terrain_clearance_m != null) terrainDetails.push("над землею: " + escapeHtml(formatNumber(softtools3d.terrain_clearance_m, 2)) + " м");
-    if (terrain.altitude != null) terrainDetails.push("export altitude: " + escapeHtml(formatNumber(terrain.altitude, 2)) + " м");
-    if (alignment3d.softtools_3d && alignment3d.softtools_3d.webodm_model) {
-      var manifest = alignment3d.softtools_3d.webodm_model;
-      if (manifest.axis_convention) terrainDetails.push("готово для 3D surface");
-    }
     var assetHtml = ["obj", "glb", "laz", "ept", "dsm", "dtm"].map(function (key) {
       return render3dAsset(key, assets[key]);
     }).join("");
@@ -696,21 +640,10 @@
     if (ortho.bounds) orthoDetails.push('bounds: ' + escapeHtml(formatBounds(ortho.bounds)));
     if (ortho.bounds_wgs84) orthoDetails.push('WGS84: ' + escapeHtml(formatBounds(ortho.bounds_wgs84)));
     if (threeD.mode) orthoDetails.push('3D режим: ' + escapeHtml(localize3dMode(threeD.mode)));
-    var summaryClass = threeD.available ? "available" : "blocked";
-    if (bridge.method === "obj_bounds_fallback" || bridge.authoritative === false) summaryClass = "blocked";
-    var bridgeWarning = "";
-    if (bridge.method === "obj_bounds_fallback" || bridge.authoritative === false) {
-      bridgeWarning =
-        '<div class="smartalign-3d-summary danger">' +
-          'Точної 3D-прив’язки немає: використовується preview-only bridge. Для застосування 3D або Delta/SLPK потрібен odm_orthophoto_corners.txt.' +
-        '</div>';
-    }
     return '' +
       '<div class="smartalign-3d-diagnostics">' +
-        '<div class="smartalign-3d-summary ' + summaryClass + '">' + escapeHtml(threeD.reason || "") + '</div>' +
-        bridgeWarning +
+        '<div class="smartalign-3d-summary ' + (threeD.available ? "available" : "blocked") + '">' + escapeHtml(threeD.reason || "") + '</div>' +
         (orthoDetails.length ? '<div class="smartalign-3d-ortho">' + orthoDetails.join(' · ') + '</div>' : '') +
-        (terrainDetails.length ? '<div class="smartalign-3d-ortho">Поверхня: ' + terrainDetails.join(' · ') + '</div>' : '') +
         '<div class="smartalign-3d-assets">' + assetHtml + '</div>' +
         blockerHtml +
       '</div>';
@@ -731,24 +664,37 @@
     var alignment = state.info && state.info.alignment;
     var threeD = state.info && state.info.three_d || {};
     var hasViewer = threeD.viewer && threeD.viewer.obj_url;
-    var cesium = state.info && state.info.cesium || {};
-    var unsafeBridge = hasUnsafe3dBridge();
-    var canRegenerateBridge = hasViewer && (unsafeBridge || threeD.bridge_regenerate_supported);
+    var alignment3d = state.info && state.info.alignment_3d;
+    var replacement3d = state.info && state.info.replacement_3d;
+    var disabled = !alignment || !hasViewer || state.aligning3d;
+    var title = "";
+    if (!alignment) title = "Спочатку розрахуйте прив’язку ортофото";
+    else if (!hasViewer) title = "OBJ модель недоступна";
+    else title = "Окремо підготувати 3D прив’язку";
 
     var html = "";
-    if (alignment && hasViewer && !unsafeBridge) {
-      var cesiumGenerating = !!cesium.generating;
-      var cesiumReady = !!cesium.available;
-      var cesiumLabel = cesiumGenerating ? "Модель готується..." : (cesiumReady ? "Коригування моделі" : "Коригування моделі");
-      html += '<button type="button" class="btn btn-default" id="smartalign-cesium3d" ' +
-        (cesiumGenerating ? "disabled " : "") +
-        'title="' + escapeHtml(cesium.reason || "Відкрити коригування моделі на рельєфі") + '"><i class="fa fa-globe"></i> ' + cesiumLabel + '</button>';
+    if (state.mode !== "3d") {
+      html += '<button type="button" class="btn btn-default" id="smartalign-align3d" ' +
+        (disabled ? "disabled " : "") +
+        'title="' + escapeHtml(title) + '"><i class="fa fa-cube"></i> ' +
+        (alignment3d ? "Оновити 3D" : "Прив’язати 3D") +
+        '</button>';
     }
 
-    if (canRegenerateBridge) {
-      html += '<button type="button" class="btn btn-warning" id="smartalign-regenerate3dbridge" ' +
-        (state.aligning3d ? "disabled " : "") +
-        'title="Скопіювати odm_orthophoto_corners.txt і перебудувати точний 3D bridge"><i class="fa fa-refresh"></i> Оновити 3D bridge</button>';
+    if (alignment3d) {
+      html += '<button type="button" class="btn btn-default" id="smartalign-replace3d" ' +
+        (state.replacing3d ? "disabled " : "") +
+        'title="Застосувати підготовлену 3D модель окремо від ортофото"><i class="fa fa-cubes"></i> ' +
+        (state.replacing3d ? "Застосування 3D..." : "Застосувати 3D") +
+        '</button>';
+    }
+
+    if (replacement3d && replacement3d.active) {
+      html += '<button type="button" class="btn btn-warning" id="smartalign-restore3d" ' +
+        (state.restoring3d ? "disabled " : "") +
+        'title="Відновити оригінальну 3D модель"><i class="fa fa-undo"></i> ' +
+        (state.restoring3d ? "Відновлення 3D..." : "Відновити 3D") +
+        '</button>';
     }
 
     return html;
@@ -778,7 +724,7 @@
           '<div class="smartalign-topbar">' +
             '<button type="button" class="btn btn-default smartalign-back" id="smartalign-back-ortho"><i class="fa fa-arrow-left"></i> Ортофото</button>' +
             '<div class="smartalign-toolbar">' +
-              '<button type="button" class="btn btn-primary" id="smartalign-3d-calculate" ' + ((state.info && state.info.alignment && !state.aligning3d && !hasUnsafe3dBridge()) ? "" : "disabled") + '><i class="fa fa-cube"></i> ' + (state.aligning3d ? "Збереження..." : "Зберегти 3D") + '</button>' +
+              '<button type="button" class="btn btn-primary" id="smartalign-3d-calculate" ' + ((state.info && state.info.alignment && !state.aligning3d) ? "" : "disabled") + '><i class="fa fa-cube"></i> ' + (state.aligning3d ? "Збереження..." : "Зберегти 3D") + '</button>' +
               render3dTransformToolbar() +
               render3dAction() +
             '</div>' +
@@ -895,7 +841,7 @@
     }
     ensureThree()
       .then(function () {
-        init3dViewer(container, objUrl, container.getAttribute("data-resource-url") || "", container.getAttribute("data-mtl-path") || "", container.getAttribute("data-terrain-url") || "");
+        init3dViewer(container, objUrl, container.getAttribute("data-resource-url") || "", container.getAttribute("data-mtl-path") || "");
       })
       .catch(function (error) {
         state.threeError = error.message || String(error);
@@ -964,7 +910,7 @@
     });
   }
 
-  function init3dViewer(container, objUrl, resourceUrl, mtlPath, terrainUrl) {
+  function init3dViewer(container, objUrl, resourceUrl, mtlPath) {
     dispose3dViewer();
     state.threeError = "";
     var width = Math.max(320, container.clientWidth || 640);
@@ -1011,7 +957,7 @@
       });
       threeScene.add(object);
       apply3dPlacementPreview();
-      add3dGroundPlane(object, terrainUrl);
+      add3dGroundPlane(object);
       attach3dTransformControls(object);
       fitCameraToObject(object);
     }).catch(function (error) {
@@ -1084,7 +1030,7 @@
     status.textContent = state.threeError || (
       "3D від ортофото: X " + formatNumber(placement.offset_x, 2) +
       " м, Y " + formatNumber(placement.offset_y, 2) +
-      " м, над землею " + formatNumber(placement.offset_z, 2) +
+      " м, Z " + formatNumber(placement.offset_z, 2) +
       " м, поворот " + formatNumber(placement.yaw_deg, 1) +
       "°, масштаб " + formatNumber(placement.scale, 3)
     );
@@ -1217,53 +1163,12 @@
     });
   }
 
-  function add3dTerrainSurface(terrainUrl) {
-    if (!terrainUrl || !window.THREE || !threeScene) return;
-    requestJson(terrainUrl).then(function (surface) {
-      if (!surface || !surface.available || !Array.isArray(surface.vertices)) return;
-      var rows = Number(surface.rows || 0);
-      var cols = Number(surface.cols || 0);
-      if (rows < 2 || cols < 2 || surface.vertices.length !== rows * cols) return;
-      var positions = [];
-      surface.vertices.forEach(function (vertex) {
-        positions.push(Number(vertex[0] || 0), Number(vertex[1] || 0), Number(vertex[2] || 0));
-      });
-      var indices = [];
-      for (var row = 0; row < rows - 1; row += 1) {
-        for (var col = 0; col < cols - 1; col += 1) {
-          var a = row * cols + col;
-          var b = a + 1;
-          var c = a + cols;
-          var d = c + 1;
-          indices.push(a, c, b, b, c, d);
-        }
-      }
-      var geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-      geometry.setIndex(indices);
-      geometry.computeVertexNormals();
-      var material = new THREE.MeshLambertMaterial({
-        color: 0x4f8f5b,
-        opacity: 0.58,
-        side: THREE.DoubleSide,
-        transparent: true,
-        wireframe: false
-      });
-      var mesh = new THREE.Mesh(geometry, material);
-      mesh.renderOrder = -1;
-      threeScene.add(mesh);
-    }).catch(function () {});
-  }
-
-  function add3dGroundPlane(object, terrainUrl) {
+  function add3dGroundPlane(object) {
     if (!window.THREE || !threeScene) return;
     var box = new THREE.Box3().setFromObject(object);
     var size = box.getSize(new THREE.Vector3());
     var center = box.getCenter(new THREE.Vector3());
     var planeSize = Math.max(size.x, size.y, size.z, 1) * 1.35;
-    var placement = normalize3dPlacement(state.placement3d);
-    var clearance = Number(placement.offset_z || 0);
-    if (!Number.isFinite(clearance)) clearance = 0;
     var geometry = new THREE.PlaneGeometry(planeSize, planeSize);
     var fallbackMaterial = new THREE.MeshLambertMaterial({
       color: 0x384a36,
@@ -1272,7 +1177,7 @@
       transparent: true
     });
     threeGround = new THREE.Mesh(geometry, fallbackMaterial);
-    threeGround.position.set(center.x, center.y, box.min.z - clearance - Math.max(planeSize * 0.002, 0.05));
+    threeGround.position.set(center.x, center.y, box.min.z - Math.max(planeSize * 0.002, 0.05));
     threeScene.add(threeGround);
 
     var grid = new THREE.GridHelper(planeSize, 20, 0x75a7ff, 0x4d5965);
@@ -1291,7 +1196,6 @@
         transparent: true
       });
     }).catch(function () {});
-    add3dTerrainSurface(terrainUrl);
   }
 
   function pick3dPoint(event, canvas) {
@@ -1349,7 +1253,7 @@
 
     var resetPlacement = document.getElementById("smartalign-3d-reset-placement");
     if (resetPlacement) resetPlacement.addEventListener("click", function () {
-      set3dPlacement({ offset_x: 0, offset_y: 0, offset_z: 1, yaw_deg: 0, scale: 1 });
+      set3dPlacement({ offset_x: 0, offset_y: 0, offset_z: 0, yaw_deg: 0, scale: 1 });
     });
 
     Array.prototype.forEach.call(root.querySelectorAll("[data-3d-placement]"), function (input) {
@@ -1422,14 +1326,6 @@
 
     var align3d = document.getElementById("smartalign-align3d");
     if (align3d) align3d.addEventListener("click", align3dModel);
-
-    var regenerate3dBridge = document.getElementById("smartalign-regenerate3dbridge");
-    if (regenerate3dBridge) regenerate3dBridge.addEventListener("click", regenerate3dBridgeModel);
-
-    var cesium3d = document.getElementById("smartalign-cesium3d");
-    if (cesium3d) cesium3d.addEventListener("click", function () {
-      window.location.href = cesiumUrl();
-    });
 
     var replace3d = document.getElementById("smartalign-replace3d");
     if (replace3d) replace3d.addEventListener("click", replace3dModel);
@@ -1601,15 +1497,12 @@
       return response.json();
     }).then(function (json) {
       state.info.alignment = json.alignment;
-      state.info.alignment_3d = json.alignment_3d || null;
-      state.info.three_d = json.three_d || state.info.three_d;
-      state.info.cesium = json.cesium || state.info.cesium;
+      state.info.alignment_3d = null;
       state.assetWriteDirty = true;
       if (json.alignment && json.alignment.quality === "FAILED") {
         window.alert("Прив’язку створено, але якість слабка. Перевірте точки: похибка " + Number(json.alignment.rmse || 0).toFixed(2) + " м.");
       }
       render();
-      scheduleCesiumPolling();
     }).catch(function (error) {
       window.alert(error.message || String(error));
     }).finally(function () {
@@ -1726,7 +1619,6 @@
     postJson("align-3d/", payload)
       .then(function (json) {
         state.info.alignment_3d = json.alignment_3d;
-        state.info.cesium = json.cesium || state.info.cesium;
         if (json.alignment_3d && json.alignment_3d.placement) {
           state.placement3d = normalize3dPlacement(json.alignment_3d.placement);
         }
@@ -1742,7 +1634,6 @@
           });
         }
         render();
-        scheduleCesiumPolling();
       })
       .catch(function (error) {
         window.alert(error.message || String(error));
@@ -1766,26 +1657,6 @@
       })
       .finally(function () {
         state.exportingDelta3d = false;
-        render();
-      });
-  }
-
-  function regenerate3dBridgeModel() {
-    state.aligning3d = true;
-    render();
-    postJson("regenerate-3d-bridge/", {})
-      .then(function (json) {
-        state.info.three_d = json.three_d || state.info.three_d;
-        state.info.alignment_3d = json.alignment_3d || null;
-        state.info.replacement_3d = json.replacement_3d || state.info.replacement_3d;
-        window.alert("3D bridge перебудовано. Перевірте висоту над землею і збережіть 3D ще раз.");
-        render();
-      })
-      .catch(function (error) {
-        window.alert(error.message || String(error));
-      })
-      .finally(function () {
-        state.aligning3d = false;
         render();
       });
   }
@@ -2247,7 +2118,6 @@
         var initial = initialMapViewFromOrthophoto();
         state.mapView = { lat: initial.lat, lng: initial.lng, zoom: initial.zoom || 16 };
         render();
-        scheduleCesiumPolling();
       })
       .catch(function (error) {
         root.innerHTML = '<div class="alert alert-danger">' + escapeHtml(error.message || String(error)) + '</div>';

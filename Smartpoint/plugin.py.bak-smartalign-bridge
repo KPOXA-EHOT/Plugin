@@ -1663,7 +1663,7 @@ class Plugin(SmartAlignMixin, PluginBase):
             return None
 
         axis_convention = delta_manifest.get("axis_convention")
-        if axis_convention and axis_convention not in ("obj2tiles_xz_y_height", "z_up_east_north_height"):
+        if axis_convention and axis_convention != "obj2tiles_xz_y_height":
             raise ValueError("SmartAlign 3D source has incompatible axis convention: {}".format(axis_convention))
 
         source_obj = delta_manifest.get("source_obj") or task.assets_path(
@@ -1680,9 +1680,9 @@ class Plugin(SmartAlignMixin, PluginBase):
             "reference_path": reference_path,
             "manifest_path": delta_manifest_path,
             "manifest": delta_manifest,
-            "source_kind": "SmartAlign Delta Z-up" if axis_convention == "z_up_east_north_height" else "SmartAlign Delta Y-up",
-            "axis_convention": axis_convention or "obj2tiles_xz_y_height",
-            "obj2tiles_flags": delta_manifest.get("obj2tiles_flags") or ([] if axis_convention == "z_up_east_north_height" else ["--y-up-to-z-up"])
+            "source_kind": "SmartAlign Delta Y-up",
+            "axis_convention": "obj2tiles_xz_y_height",
+            "obj2tiles_flags": delta_manifest.get("obj2tiles_flags") or ["--y-up-to-z-up"]
         }
 
     def get_delta_3d_source_obj(self, task):
@@ -1884,10 +1884,8 @@ class Plugin(SmartAlignMixin, PluginBase):
 
     def create_delta_3d_export(self, task):
         self.cleanup_delta_exports()
-        if hasattr(self, "ensure_3d_export_not_using_preview_bridge"):
-            self.ensure_3d_export_not_using_preview_bridge(task)
-        alignment_3d = self.load_json(task, "alignment_3d.json") if hasattr(self, "load_json") else None
-        if not alignment_3d and hasattr(self, "load_json") and self.load_json(task, "alignment.json") and hasattr(self, "align_3d_model"):
+        alignment = self.load_json(task, "alignment.json") if hasattr(self, "load_json") else None
+        if alignment and hasattr(self, "align_3d_model"):
             self.align_3d_model(task)
         alignment_3d = self.load_json(task, "alignment_3d.json") if hasattr(self, "load_json") else None
         if alignment_3d and hasattr(self, "prepare_smartalign_softtools_3d_artifacts"):
@@ -1927,8 +1925,7 @@ class Plugin(SmartAlignMixin, PluginBase):
         tileset_path = safe_child(tiles_root, "tileset.json")
         if not os.path.isfile(tileset_path):
             raise ValueError("Obj2Tiles completed but did not create tileset.json")
-        source_axis_convention = smartalign_source.get("axis_convention") if smartalign_source else ""
-        gltf_up_axis = "Z" if source_axis_convention in ("webodm_xy_z_height", "z_up_east_north_height") else "Y"
+        gltf_up_axis = "Z" if smartalign_source and smartalign_source.get("axis_convention") == "webodm_xy_z_height" else "Y"
         self.set_delta_3d_tileset_gltf_up_axis(tileset_path, gltf_up_axis)
 
         self.run_delta_3d_process([

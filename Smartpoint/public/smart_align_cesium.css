@@ -1,0 +1,102 @@
+.smartalign-cesium-shell {
+  background: #f5f6f8;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 78px);
+  min-height: 560px;
+  padding: 10px;
+}
+
+.smartalign-cesium-viewer {
+  background: #101828;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  box-sizing: border-box;
+  flex: 1 1 auto;
+  min-height: 0;
+  order: 2;
+  overflow: hidden;
+  position: relative;
+}
+
+.smartalign-cesium-panel {
+  align-items: center;
+  background: #fff;
+  border: 1px solid #d0d5dd;
+  border-radius: 4px;
+  box-sizing: border-box;
+  color: #344054;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-bottom: 10px;
+  order: 1;
+  padding: 10px;
+  position: relative;
+  width: 100%;
+}
+
+.smartalign-cesium-panel-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 0;
+}
+
+.smartalign-cesium-panel-row label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.smartalign-cesium-panel input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  color: #101828;
+  border: 1px solid #d0d5dd;
+  padding: 4px 8px;
+}
+
+.smartalign-cesium-status {
+  color: #667085;
+  flex: 1 1 100%;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.smartalign-cesium-error {
+  color: #b42318;
+}
+
+#smartalign-cesium-height {
+  max-width: 320px;
+  min-width: 120px;
+}
+
+@media (max-width: 900px) {
+  .smartalign-cesium-shell {
+    height: auto;
+    min-height: calc(100vh - 78px);
+  }
+
+  .smartalign-cesium-panel,
+  .smartalign-cesium-panel-row {
+    align-items: stretch;
+  }
+
+  .smartalign-cesium-panel-row {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+
+  .smartalign-cesium-viewer {
+    min-height: 520px;
+  }
+
+  #smartalign-cesium-height {
+    max-width: none;
+    min-width: 180px;
+  }
+}

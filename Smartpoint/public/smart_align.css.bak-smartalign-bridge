@@ -664,12 +664,6 @@
   background: #fffaeb;
 }
 
-.smartalign-3d-summary.danger {
-  border-left-color: #d92d20;
-  background: #fef3f2;
-  color: #7a271a;
-}
-
 .smartalign-3d-ortho {
   color: #667085;
   font-size: 12px;
